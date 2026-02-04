@@ -29,6 +29,7 @@ wheels/
 
 # Streamlit
 .streamlit/secrets.toml
+# .streamlit/config.toml は含める（テーマ設定のため）
 
 # IDE
 .vscode/
@@ -44,3 +45,35 @@ Thumbs.db
 # 環境変数
 .env
 .env.local
+
+# Excel一時ファイル
+~$*.xlsx
+~$*.xls
+
+# Excelファイル（個人用設定のためGitHubには含めない）
+*.xlsx
+*.xls
+!config/*.xlsx.example
+
+# Optuna
+optuna.db
+*.db
+
+# 設定ファイル（個人用）
+config/*.xlsx
+!config/README.md
+
+# 一時ファイル
+*.tmp
+*.log
+*.bak
+
+# Windowsバッチファイル（Streamlit Cloudでは不要）
+*.bat
+
+# Jupyter Notebook（オプション - 含めたい場合は削除）
+*.ipynb
+.ipynb_checkpoints/
+
+# PDFファイル（オプション）
+*.pdf

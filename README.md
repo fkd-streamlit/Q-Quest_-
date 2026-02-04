@@ -36,6 +36,8 @@
 - Jupyter Notebook（実験・プロトタイプ）
 - **Streamlit（Webアプリケーション）** ⭐NEW
 - **Plotly（インタラクティブ3D可視化）** ⭐NEW
+- **Pandas + OpenPyXL（Excel設定ファイル読み込み）** ⭐NEW
+- **Optuna（QUBO最適化の可視化）** ⭐NEW
 
 ## プロジェクト構造
 
@@ -48,6 +50,7 @@ Q-Quest_量子神託/
 ├── QUICK_START.md            # クイックスタートガイド
 ├── CONTRIBUTING.md           # 貢献ガイドライン
 └── docs/                     # ドキュメント
+    ├── README.md             # ドキュメント一覧と活用方法
     ├── PROJECT_VISION.md     # プロジェクトビジョン
     ├── CULTURAL_ELEMENTS.md  # 文化的要素の説明
     ├── DEVELOPMENT_ROADMAP.md # 開発ロードマップ
@@ -56,13 +59,40 @@ Q-Quest_量子神託/
 
 ## クイックスタート
 
-### 必要な環境
+### 方法1: Streamlitアプリで実行（推奨）⭐
 
+**最も簡単な方法：**
+
+1. **バッチファイルで起動**
+   ```bash
+   # Windowsの場合
+   start_app.bat をダブルクリック
+   ```
+
+2. **または、コマンドで起動**
+   ```bash
+   # 依存パッケージのインストール（初回のみ）
+   pip install -r requirements.txt
+   
+   # Streamlitアプリを起動
+   streamlit run app.py
+   ```
+
+3. **ブラウザが自動的に開きます**（通常は `http://localhost:8501`）
+
+**機能：**
+- ✅ 対話型量子神託：願い事を入力して神託を受ける
+- ✅ 絵馬納め：願いを絵馬に書いて納める
+- ✅ 言葉のエネルギー球体視覚化：3Dでキーワードを可視化
+- ✅ Excel設定ファイルの読み込み：k行列とl行列をチューニング可能
+
+### 方法2: Jupyter Notebookで実行
+
+**必要な環境：**
 - Python 3.8以上
 - Jupyter Notebook
 
-### セットアップ
-
+**セットアップ：**
 ```bash
 # 依存パッケージのインストール
 pip install -r requirements.txt
@@ -71,7 +101,52 @@ pip install -r requirements.txt
 jupyter notebook Q_QUEST_量子神託.ipynb
 ```
 
+### 方法3: GitHub + Streamlit Cloudで共有（チーム向け）⭐
+
+**完全無料でアプリを共有：**
+
+1. **GitHubリポジトリを作成**
+   - [GitHub](https://github.com) でリポジトリを作成
+
+2. **コードをプッシュ**
+   ```bash
+   # 自動スクリプトを使用（推奨）
+   deploy_to_github.bat をダブルクリック
+   
+   # または手動で実行
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git branch -M main
+   git remote add origin https://github.com/あなたのユーザー名/リポジトリ名.git
+   git push -u origin main
+   ```
+
+3. **Streamlit Cloudでデプロイ**
+   - [Streamlit Cloud](https://streamlit.io/cloud) にアクセス
+   - 「Sign in」→「New app」をクリック
+   - リポジトリを選択、Branch: `main`、Main file: `app.py`
+   - 「Deploy」をクリック
+
+**詳細は `デプロイ手順_簡易版.md` を参照してください。**
+
 ## 機能
+
+### Streamlitアプリ（`app.py`）⭐NEW
+
+**4つの実行モード：**
+
+1. **基本デモ**: QUBOモデルの基本動作を確認
+2. **対話型量子神託**: 願い事を入力して、パーソナライズされた神託を受ける
+3. **言葉のエネルギー球体視覚化**: 入力したキーワードを3D球体で可視化
+4. **絵馬納め**: 願いを絵馬に書いて納めると、12神のうち適切な神が現れて神託を授ける
+
+**Excel設定ファイルの読み込み機能：**
+- k行列（12x12：キャラクター × 誓願）とl行列（12x4：キャラクター × 世界観軸）をExcelから読み込み
+- 12神の設定をExcelでチューニング可能
+- 詳細は `EXCEL_SETUP_GUIDE.md` を参照
+
+### Jupyter Notebook（`Q_QUEST_量子神託.ipynb`）
 
 Notebookには4つの主要なCellがあります：
 

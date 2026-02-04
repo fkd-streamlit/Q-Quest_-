@@ -7,7 +7,7 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import itertools
 import math
@@ -15,6 +15,58 @@ import random
 import re
 import time
 from collections import Counter
+import pandas as pd
+import io
+import os
+
+# Optuna for QUBO optimization visualization
+try:
+    import optuna
+    from optuna.visualization import plot_optimization_history, plot_param_importances
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    optuna = None
+
+# -------------------------
+# 文字列ユーティリティ
+# -------------------------
+def _split_multi_text(cell_value: str) -> List[str]:
+    """Excelセル内の複数テキストを分割（改行 / '||' 区切り対応）"""
+    if cell_value is None:
+        return []
+    s = str(cell_value).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return []
+    # '||' と改行を同一視して分割
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    parts: List[str] = []
+    for chunk in s.split("||"):
+        parts.extend([p.strip() for p in chunk.split("\n") if p.strip()])
+    return [p for p in parts if p]
+
+def _parse_tagged_quote(line: str) -> Dict[str, object]:
+    """'タグ1,タグ2::本文' 形式をパース。タグがなければ tags=[]"""
+    raw = (line or "").strip()
+    if "::" in raw:
+        tag_part, quote_part = raw.split("::", 1)
+        tags = [t.strip() for t in tag_part.split(",") if t.strip()]
+        quote = quote_part.strip()
+        return {"text": quote, "tags": tags}
+    return {"text": raw, "tags": []}
+
+def extract_keywords_safe(text: str, top_n: int = 6) -> List[str]:
+    """UI/最適化用のキーワード抽出（失敗しても落とさない）"""
+    try:
+        return extract_keywords(text, top_n=top_n)  # 既存関数を利用（後方で定義される）
+    except Exception:
+        # extract_keywords 定義前に呼ばれた等の保険
+        t = (text or "").strip()
+        if not t:
+            return []
+        # 簡易: 2文字以上の連続を上位
+        tokens = [w for w in re.split(r"[\s、。,.!！?？]+", t) if len(w) >= 2]
+        return tokens[:top_n]
 
 # ページ設定
 st.set_page_config(
@@ -31,37 +83,214 @@ matplotlib.use('Agg')  # Streamlitでのバックエンド設定
 # -------------------------
 # データ定義
 # -------------------------
-# 気持ちを整えるための格言（VARIABLES）と引用元
-VARIABLES = [
-    "止まることで、流れが見える。動の中に静がある。",
-    "水は、争わない。形にこだわらず、流れるがままに。",
-    "間こそが答えである。余白にこそ本質がある。",
-    "己に誠実であること。それが自由への道である。",
+# 12神の定義と属性マッピング（秋葉原テーマ）
+# 各神は12個の誓願（誓願01～12）と4つの役割属性（静、流、間、誠）を持つ
+TWELVE_GODS = [
+    {
+        "id": 0,
+        "name": "秋葉三尺坊",
+        "name_en": "Akiba Sanjakubo",
+        "attribute": "火",
+        "emoji": "🔥",
+        # 誓願01～12の数値配置（添付資料より）
+        "vows": {
+            "vow01": -0.4, "vow02": 0.2, "vow03": -0.2, "vow04": 0.0, "vow05": 0.0,
+            "vow06": 0.0, "vow07": 0.0, "vow08": -0.4, "vow09": 0.0, "vow10": 0.0,
+            "vow11": 0.0, "vow12": -0.2
+        },
+        # 役割属性（静、流、間、誠）
+        "roles": {"stillness": 0.0, "flow": -0.2, "ma": 0.0, "sincerity": -0.4},
+        "maxim": "勢いMAX: 情熱的な筆致に降臨。",
+        "description": "秋葉原の守護神。火伏せ=「炎上回避」の神。"
+    },
+    {
+        "id": 1,
+        "name": "真空管大将軍",
+        "name_en": "Vacuum Tube General",
+        "attribute": "電",
+        "emoji": "⚡",
+        "vows": {
+            "vow01": -0.2, "vow02": 0.2, "vow03": 0.0, "vow04": -0.4, "vow05": -0.2,
+            "vow06": 0.0, "vow07": 0.0, "vow08": 0.0, "vow09": 0.0, "vow10": 0.0,
+            "vow11": 0.0, "vow12": -0.4
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": 0.0, "sincerity": -0.2},
+        "maxim": "線の太さ: 力強く、太い線に反応。",
+        "description": "秋葉原の原点。増幅=「才能開花」の神。"
+    },
+    {
+        "id": 2,
+        "name": "LED弁財天",
+        "name_en": "LED Benzaiten",
+        "attribute": "光",
+        "emoji": "💡",
+        "vows": {
+            "vow01": 0.0, "vow02": 0.2, "vow03": 0.0, "vow04": -0.4, "vow05": 0.0,
+            "vow06": 0.0, "vow07": 0.0, "vow08": 0.0, "vow09": -0.4, "vow10": 0.0,
+            "vow11": -0.2, "vow12": -0.2
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": -0.2, "sincerity": 0.0},
+        "maxim": "丸み: 華やかで曲線的な筆跡。",
+        "description": "イルミネーションと発光。「自己表現」の神。"
+    },
+    {
+        "id": 3,
+        "name": "磁気記録黒龍",
+        "name_en": "Magnetic Recording Black Dragon",
+        "attribute": "磁",
+        "emoji": "🐉",
+        "vows": {
+            "vow01": 0.0, "vow02": 0.0, "vow03": -0.4, "vow04": 0.0, "vow05": -0.2,
+            "vow06": 0.0, "vow07": 0.0, "vow08": 0.0, "vow09": 0.0, "vow10": -0.4,
+            "vow11": -0.2, "vow12": 0.2
+        },
+        "roles": {"stillness": -0.2, "flow": 0.0, "ma": 0.0, "sincerity": -0.4},
+        "maxim": "緻密さ: 細かく丁寧な書き込み。",
+        "description": "HDDやテープ。記憶=「温故知新」の守護龍。"
+    },
+    {
+        "id": 4,
+        "name": "無線傍受観音",
+        "name_en": "Wireless Interception Kannon",
+        "attribute": "波",
+        "emoji": "📡",
+        "vows": {
+            "vow01": -0.4, "vow02": 0.2, "vow03": 0.0, "vow04": -0.2, "vow05": -0.4,
+            "vow06": 0.0, "vow07": 0.0, "vow08": 0.0, "vow09": 0.0, "vow10": 0.0,
+            "vow11": 0.0, "vow12": -0.2
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": -0.2, "sincerity": 0.0},
+        "maxim": "ゆらぎ: 震えや迷いがある筆跡に寄り添う。",
+        "description": "電波と通信。縁結び=「マッチング」の神。"
+    },
+    {
+        "id": 5,
+        "name": "基板曼荼羅",
+        "name_en": "Circuit Board Mandala",
+        "attribute": "基",
+        "emoji": "🔌",
+        "vows": {
+            "vow01": 0.0, "vow02": -0.2, "vow03": 0.0, "vow04": 0.0, "vow05": 0.0,
+            "vow06": -0.4, "vow07": -0.4, "vow08": 0.0, "vow09": 0.2, "vow10": -0.2,
+            "vow11": 0.0, "vow12": 0.0
+        },
+        "roles": {"stillness": -0.4, "flow": 0.0, "ma": 0.0, "sincerity": -0.2},
+        "maxim": "直線的: 迷いのない、カクカクした線。",
+        "description": "回路設計。秩序=「論理的思考」の神。"
+    },
+    {
+        "id": 6,
+        "name": "絶対零度明王",
+        "name_en": "Absolute Zero Myo-o",
+        "attribute": "冷",
+        "emoji": "❄️",
+        "vows": {
+            "vow01": 0.0, "vow02": -0.4, "vow03": -0.2, "vow04": 0.0, "vow05": 0.0,
+            "vow06": 0.0, "vow07": -0.4, "vow08": 0.0, "vow09": 0.0, "vow10": 0.0,
+            "vow11": -0.2, "vow12": 0.2
+        },
+        "roles": {"stillness": -0.4, "flow": 0.0, "ma": -0.2, "sincerity": 0.0},
+        "maxim": "筆圧弱め: クールで淡々とした筆跡。",
+        "description": "冷却ファン・超電導。冷静=「沈着冷静」の神。"
+    },
+    {
+        "id": 7,
+        "name": "ジャンク再生童子",
+        "name_en": "Junk Regeneration Child",
+        "attribute": "壊",
+        "emoji": "🔧",
+        "vows": {
+            "vow01": -0.2, "vow02": 0.0, "vow03": 0.0, "vow04": -0.2, "vow05": 0.0,
+            "vow06": 0.0, "vow07": 0.2, "vow08": -0.4, "vow09": 0.0, "vow10": 0.0,
+            "vow11": 0.0, "vow12": -0.4
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": 0.0, "sincerity": -0.2},
+        "maxim": "かすれ: 荒々しい、または掠れた線。",
+        "description": "秋葉原のジャンク品。復活=「再起・リトヲ」の神。"
+    },
+    {
+        "id": 8,
+        "name": "真空オーディオ如来",
+        "name_en": "Vacuum Audio Nyorai",
+        "attribute": "音",
+        "emoji": "🎧",
+        "vows": {
+            "vow01": 0.0, "vow02": 0.0, "vow03": 0.0, "vow04": -0.2, "vow05": -0.4,
+            "vow06": 0.0, "vow07": 0.2, "vow08": 0.0, "vow09": -0.2, "vow10": 0.0,
+            "vow11": -0.4, "vow12": 0.0
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": -0.2, "sincerity": 0.0},
+        "maxim": "調和: 文字全体のバランスが良い。",
+        "description": "高音質・共鳴。「本質を見極める」神。"
+    },
+    {
+        "id": 9,
+        "name": "ハンダ付け結び神",
+        "name_en": "Soldering Connection Deity",
+        "attribute": "結",
+        "emoji": "🔗",
+        "vows": {
+            "vow01": 0.0, "vow02": -0.4, "vow03": -0.2, "vow04": 0.0, "vow05": -0.4,
+            "vow06": 0.0, "vow07": -0.2, "vow08": 0.0, "vow09": 0.0, "vow10": 0.0,
+            "vow11": 0.0, "vow12": 0.2
+        },
+        "roles": {"stillness": -0.2, "flow": 0.0, "ma": -0.4, "sincerity": 0.0},
+        "maxim": "トメ・ハネ: 繋ぎ部分がしっかりしている。",
+        "description": "接点と結合。協力=「チームワーク」の神。"
+    },
+    {
+        "id": 10,
+        "name": "光速通信韋駄天",
+        "name_en": "Light-speed Communication Idaten",
+        "attribute": "速",
+        "emoji": "🚀",
+        "vows": {
+            "vow01": 0.0, "vow02": 0.2, "vow03": 0.0, "vow04": -0.2, "vow05": -0.4,
+            "vow06": 0.0, "vow07": 0.0, "vow08": 0.0, "vow09": -0.2, "vow10": 0.0,
+            "vow11": 0.0, "vow12": -0.4
+        },
+        "roles": {"stillness": 0.0, "flow": -0.4, "ma": 0.0, "sincerity": -0.2},
+        "maxim": "書き速度: サッと短時間で書いた線。",
+        "description": "5G・光回線。爆速=「即断即決」の神。"
+    },
+    {
+        "id": 11,
+        "name": "半導体文殊",
+        "name_en": "Semiconductor Manjushri",
+        "attribute": "智",
+        "emoji": "🧠",
+        "vows": {
+            "vow01": 0.0, "vow02": 0.0, "vow03": -0.2, "vow04": 0.0, "vow05": 0.0,
+            "vow06": -0.4, "vow07": -0.2, "vow08": 0.0, "vow09": 0.0, "vow10": -0.4,
+            "vow11": 0.0, "vow12": 0.2
+        },
+        "roles": {"stillness": -0.4, "flow": 0.0, "ma": 0.0, "sincerity": -0.2},
+        "maxim": "規則性: 等間隔で整理された筆跡。",
+        "description": "CPU・AI。計算=「合格・知略」の神。"
+    },
 ]
 
-# 格言の引用元
-MAXIM_SOURCES = {
-    "止まることで、流れが見える。動の中に静がある。": {
-        "source": "禅の思想",
-        "origin": "禅宗の教えから",
-        "reference": "動と静の調和を説く禅の教義に基づく"
-    },
-    "水は、争わない。形にこだわらず、流れるがままに。": {
-        "source": "老子『道徳経』",
-        "origin": "第八章「上善若水」",
-        "reference": "「上善は水の若し。水は善く万物を利して争わず」"
-    },
-    "間こそが答えである。余白にこそ本質がある。": {
-        "source": "日本の美学思想",
-        "origin": "「間（Ma）」の概念",
-        "reference": "能楽、茶道、俳句などに通底する日本の美意識"
-    },
-    "己に誠実であること。それが自由への道である。": {
-        "source": "エピクテトス『語録』",
-        "origin": "ストア派哲学",
-        "reference": "「自分自身に対して誠実であることこそ、真の自由につながる」という思想"
-    },
-}
+# 気持ちを整えるための格言（VARIABLES）を12神の格言に更新
+VARIABLES = [god["maxim"] for god in TWELVE_GODS]
+
+# 感覚層の変数定義（添付資料より）
+SENSATION_VARIABLES = [
+    "迷い",      # x1: Hesitation/Confusion
+    "焦り",      # x2: Impatience/Anxiety
+    "静けさ",    # x3: Stillness/Calmness
+    "内省",      # x4: Introspection
+    "行動",      # x5: Action
+    "つながり",  # x6: Connection
+    "挑戦",      # x7: Challenge
+    "待つ",      # x8: Wait
+]
+
+# 格言の引用元（12神の格言に対応）
+MAXIM_SOURCES = {god["maxim"]: {
+    "source": god["name"],
+    "origin": god["name_en"],
+    "reference": god["description"]
+} for god in TWELVE_GODS}
 
 GLOBAL_WORDS_DATABASE = [
     # 願い・目標
@@ -305,113 +534,926 @@ def infer_mood(text: str) -> Mood:
         decisiveness=norm(raw["decisiveness"], scale=1.1),  # 決断力も敏感に
     )
 
+def mood_to_sensation_vector(m: Mood, binary: bool = False, scale: float = 5.0) -> np.ndarray:
+    """Moodから感覚ベクトル（x1～x8）を生成
+    
+    Args:
+        m: Moodオブジェクト
+        binary: Trueの場合、バイナリ化（0.3以上で1、それ以下で0）
+        scale: 感覚ベクトルのスケール（0〜scaleの範囲に正規化、デフォルト5.0）
+    
+    Returns:
+        感覚ベクトル（8次元）
+        - x0: 迷い, x1: 焦り, x2: 静けさ, x3: 内省, x4: 行動, x5: つながり, x6: 挑戦, x7: 待つ
+    """
+    # 感覚変数のマッピング
+    x = np.zeros(8)
+    
+    # 迷い（x0）: 不安と決断力の低さから
+    x[0] = m.anxiety * (1.0 - m.decisiveness)
+    
+    # 焦り（x1）: 不安から
+    x[1] = m.anxiety
+    
+    # 静けさ（x2）: 疲れと孤独から
+    x[2] = (m.fatigue + m.loneliness) / 2.0
+    
+    # 内省（x3）: 孤独と疲れから
+    x[3] = (m.loneliness + m.fatigue) / 2.0
+    
+    # 行動（x4）: 好奇心と決断力から
+    x[4] = (m.curiosity + m.decisiveness) / 2.0
+    
+    # つながり（x5）: 孤独の逆と好奇心から
+    x[5] = (1.0 - m.loneliness) * m.curiosity
+    
+    # 挑戦（x6）: 好奇心と決断力から
+    x[6] = m.curiosity * m.decisiveness
+    
+    # 待つ（x7）: 疲れと決断力の低さから
+    x[7] = m.fatigue * (1.0 - m.decisiveness)
+    
+    # スケール調整（0〜scaleの範囲に正規化）
+    x = x * scale
+    
+    if binary:
+        # バイナリ化（閾値0.3*scale以上で1、それ以下で0）
+        x_binary = (x >= 0.3 * scale).astype(float)
+        return x_binary
+    else:
+        # 連続値のまま返す（0〜scaleの範囲）
+        return x
+
 # -------------------------
-# QUBO生成
+# Excelファイル読み込み機能
 # -------------------------
-# QUBOパラメータ（格言同士の関係性）
+# グローバル変数：Excelから読み込んだデータを保持
+SENSE_TO_VOW_MATRIX: Optional[np.ndarray] = None  # sense_to_vow行列（8x12：感覚 × 誓願）
+K_MATRIX: Optional[np.ndarray] = None  # k行列（12x12：キャラクター × 誓願）
+L_MATRIX: Optional[np.ndarray] = None  # l行列（12x4：キャラクター × 世界観軸）
+LOADED_GODS: Optional[List[Dict]] = None  # Excelから読み込んだ12神の情報
+
+def rebuild_globals_from_gods(gods_list: List[Dict]) -> None:
+    """TWELVE_GODS 変更後に、VARIABLES / MAXIM_SOURCES を再生成"""
+    global VARIABLES, MAXIM_SOURCES
+    VARIABLES = [god.get("maxim", "") for god in gods_list]
+    # すべての格言（複数）も出典に載せる
+    maxim_sources: Dict[str, Dict] = {}
+    for god in gods_list:
+        # 単一格言
+        if god.get("maxim"):
+            maxim_sources[god["maxim"]] = {
+                "source": god.get("name", "神託"),
+                "origin": god.get("name_en", ""),
+                "reference": god.get("description", ""),
+            }
+        # 複数格言
+        for item in god.get("maxims", []) or []:
+            text = (item.get("text") if isinstance(item, dict) else str(item)).strip()
+            if text:
+                maxim_sources[text] = {
+                    "source": god.get("name", "神託"),
+                    "origin": god.get("name_en", ""),
+                    "reference": god.get("description", ""),
+                }
+    MAXIM_SOURCES = maxim_sources
+
+def load_gods_from_separate_files(
+    character_file: io.BytesIO = None,
+    k_matrix_file: io.BytesIO = None,
+    l_matrix_file: io.BytesIO = None
+) -> Tuple[List[Dict], np.ndarray, np.ndarray]:
+    """3つの別々のExcelファイルから12神の情報、k行列、l行列を読み込む
+    
+    Args:
+        character_file: 12神基本情報のExcelファイル（akiba12_character_list.xlsx）
+        k_matrix_file: k行列のExcelファイル（akiba12_character_to_vow_K.xlsx）
+        l_matrix_file: l行列のExcelファイル（akiba12_character_to_axis_L.xlsx）
+    
+    Returns:
+        (gods_list, k_matrix, l_matrix)
+    """
+    try:
+        # k行列を読み込む（キャラクター名を行インデックスとして使用）
+        if k_matrix_file is not None:
+            k_matrix_file.seek(0)
+            df_k = pd.read_excel(k_matrix_file, engine="openpyxl", header=0, index_col=0)
+            # 先頭12列・12行に正規化（余分があってもOK）
+            df_k = df_k.iloc[:12, :12]
+            k_matrix = df_k.values.astype(float)
+            character_names_from_k = df_k.index.tolist()
+        else:
+            raise ValueError("k行列ファイルが必要です")
+        
+        # l行列を読み込む（キャラクター名を行インデックスとして使用）
+        if l_matrix_file is not None:
+            l_matrix_file.seek(0)
+            df_l = pd.read_excel(l_matrix_file, engine="openpyxl", header=0, index_col=0)
+            df_l = df_l.iloc[:12, :4]
+            l_matrix = df_l.values.astype(float)
+            character_names_from_l = df_l.index.tolist()
+        else:
+            raise ValueError("l行列ファイルが必要です")
+        
+        # 12神基本情報を読み込む
+        if character_file is not None:
+            character_file.seek(0)
+            df_gods = pd.read_excel(character_file, engine="openpyxl")
+        else:
+            # 基本情報ファイルがない場合、k行列とl行列からキャラクター名を取得
+            # キャラクター名の一致を確認
+            common_names = [name for name in character_names_from_k if name in character_names_from_l]
+            if len(common_names) != 12:
+                raise ValueError(f"キャラクター名が一致しません。k行列: {len(character_names_from_k)}個, l行列: {len(character_names_from_l)}個")
+            
+            # ダミーの基本情報を作成
+            df_gods = pd.DataFrame({
+                "ID": range(12),
+                "名前": common_names,
+                "名前(英語)": [f"God {i+1}" for i in range(12)],
+                "属性": [""] * 12,
+                "絵文字": ["🔮"] * 12,
+                "説明": [""] * 12,
+                "格言": [""] * 12
+            })
+        
+        # キャラクター名のマッピングを作成（k行列とl行列の行インデックスと基本情報の名前を対応）
+        name_to_id = {}
+        for idx, row in df_gods.iterrows():
+            god_name = str(row.get("名前", ""))
+            if god_name:
+                name_to_id[god_name] = int(row.get("ID", idx))
+        
+        # 12神の情報を構築
+        gods_list = []
+        for idx, row in df_gods.iterrows():
+            god_id = int(row.get("ID", idx))
+            god_name = str(row.get("名前", ""))
+            god_name_en = str(row.get("名前(英語)", ""))
+            god_attribute = str(row.get("属性", ""))
+            god_emoji = str(row.get("絵文字", "🔮"))
+            god_description = str(row.get("説明", ""))
+            # 複数格言対応：格言 / 格言1.. / 改行 / '||' / 'タグ::本文'
+            maxim_cells: List[str] = []
+            # 列名が "格言" だけのケース
+            maxim_cells.extend(_split_multi_text(row.get("格言", "")))
+            # 列名が "格言1","格言2"... のケース
+            for col in row.index:
+                if isinstance(col, str) and col.startswith("格言") and col != "格言":
+                    maxim_cells.extend(_split_multi_text(row.get(col, "")))
+            maxims_parsed = [_parse_tagged_quote(m) for m in maxim_cells if str(m).strip()]
+            # 互換性のため先頭を maxim に入れる
+            god_maxim = maxims_parsed[0]["text"] if maxims_parsed else ""
+            
+            # k行列から誓願値を取得（キャラクター名で検索）
+            vows = {}
+            if god_name in df_k.index:
+                k_row_idx = df_k.index.get_loc(god_name)
+                for j in range(min(12, len(df_k.columns))):
+                    vow_key = f"vow{j+1:02d}"
+                    col_name = df_k.columns[j]
+                    vows[vow_key] = float(k_matrix[k_row_idx, j])
+            else:
+                # キャラクター名が見つからない場合、IDで検索
+                if god_id < len(k_matrix):
+                    for j in range(min(12, len(df_k.columns))):
+                        vow_key = f"vow{j+1:02d}"
+                        vows[vow_key] = float(k_matrix[god_id, j])
+            
+            # l行列から役割属性を取得（キャラクター名で検索）
+            role_names = ["stillness", "flow", "ma", "sincerity"]
+            roles = {}
+            if god_name in df_l.index:
+                l_row_idx = df_l.index.get_loc(god_name)
+                for j, role_name in enumerate(role_names):
+                    if j < len(df_l.columns):
+                        roles[role_name] = float(l_matrix[l_row_idx, j])
+                    else:
+                        roles[role_name] = 0.0
+            else:
+                # キャラクター名が見つからない場合、IDで検索
+                if god_id < len(l_matrix):
+                    for j, role_name in enumerate(role_names):
+                        if j < len(l_matrix[god_id]):
+                            roles[role_name] = float(l_matrix[god_id, j])
+                        else:
+                            roles[role_name] = 0.0
+            
+            god_dict = {
+                "id": god_id,
+                "name": god_name,
+                "name_en": god_name_en,
+                "attribute": god_attribute,
+                "emoji": god_emoji,
+                "vows": vows,
+                "roles": roles,
+                "maxim": god_maxim,
+                "maxims": maxims_parsed,  # 複数格言
+                "description": god_description,
+            }
+            gods_list.append(god_dict)
+        
+        return gods_list, k_matrix, l_matrix
+    
+    except Exception as e:
+        st.error(f"Excelファイルの読み込みエラー: {str(e)}")
+        import traceback
+        st.error(f"詳細: {traceback.format_exc()}")
+        raise
+
+def load_gods_from_excel(excel_file: io.BytesIO) -> Tuple[List[Dict], np.ndarray, np.ndarray]:
+    """1つのExcelファイルから12神の情報、k行列、l行列を読み込む（後方互換性のため）
+    
+    Args:
+        excel_file: Excelファイル（BytesIO）- 3つのシートを含む
+    
+    Returns:
+        (gods_list, k_matrix, l_matrix)
+    """
+    try:
+        # ファイルポインタをリセット（複数シートを読み込むため）
+        excel_file.seek(0)
+        
+        # 12神基本情報を読み込む
+        df_gods = pd.read_excel(excel_file, sheet_name="12神基本情報", engine="openpyxl")
+        
+        # ファイルポインタをリセット
+        excel_file.seek(0)
+        
+        # k行列を読み込む
+        df_k = pd.read_excel(excel_file, sheet_name="k行列", engine="openpyxl", header=0, index_col=0)
+        df_k = df_k.iloc[:12, :12]
+        k_matrix = df_k.values.astype(float)
+        
+        # ファイルポインタをリセット
+        excel_file.seek(0)
+        
+        # l行列を読み込む
+        df_l = pd.read_excel(excel_file, sheet_name="l行列", engine="openpyxl", header=0, index_col=0)
+        df_l = df_l.iloc[:12, :4]
+        l_matrix = df_l.values.astype(float)
+        
+        # 12神の情報を構築
+        gods_list = []
+        for idx, row in df_gods.iterrows():
+            god_id = int(row.get("ID", idx))
+            god_name = str(row.get("名前", ""))
+            god_name_en = str(row.get("名前(英語)", ""))
+            god_attribute = str(row.get("属性", ""))
+            god_emoji = str(row.get("絵文字", ""))
+            god_description = str(row.get("説明", ""))
+            maxim_cells: List[str] = []
+            maxim_cells.extend(_split_multi_text(row.get("格言", "")))
+            for col in row.index:
+                if isinstance(col, str) and col.startswith("格言") and col != "格言":
+                    maxim_cells.extend(_split_multi_text(row.get(col, "")))
+            maxims_parsed = [_parse_tagged_quote(m) for m in maxim_cells if str(m).strip()]
+            god_maxim = maxims_parsed[0]["text"] if maxims_parsed else str(row.get("格言", ""))
+            
+            # k行列から誓願値を取得（vow01～vow12）
+            vows = {}
+            for j in range(12):
+                vow_key = f"vow{j+1:02d}"
+                vows[vow_key] = float(k_matrix[god_id, j])
+            
+            # l行列から役割属性を取得
+            role_names = ["stillness", "flow", "ma", "sincerity"]
+            roles = {}
+            for j, role_name in enumerate(role_names):
+                roles[role_name] = float(l_matrix[god_id, j])
+            
+            god_dict = {
+                "id": god_id,
+                "name": god_name,
+                "name_en": god_name_en,
+                "attribute": god_attribute,
+                "emoji": god_emoji,
+                "vows": vows,
+                "roles": roles,
+                "maxim": god_maxim,
+                "maxims": maxims_parsed,
+                "description": god_description,
+            }
+            gods_list.append(god_dict)
+        
+        return gods_list, k_matrix, l_matrix
+    
+    except Exception as e:
+        st.error(f"Excelファイルの読み込みエラー: {str(e)}")
+        raise
+
+def load_sense_to_vow_matrix(sense_to_vow_file: io.BytesIO) -> np.ndarray:
+    """sense_to_vow行列を読み込む（8感覚 × 12誓願）
+    
+    Args:
+        sense_to_vow_file: sense_to_vow行列のExcelファイル
+    
+    Returns:
+        sense_to_vow行列（8x12）
+    """
+    try:
+        sense_to_vow_file.seek(0)
+        df_sv = pd.read_excel(sense_to_vow_file, engine="openpyxl", header=0, index_col=0)
+        # 8行×12列に正規化
+        df_sv = df_sv.iloc[:8, :12]
+        sense_to_vow_matrix = df_sv.values.astype(float)
+        return sense_to_vow_matrix
+    except Exception as e:
+        st.error(f"sense_to_vow行列の読み込みエラー: {str(e)}")
+        raise
+
+def load_all_excel_files(
+    character_file: io.BytesIO = None,
+    maxim_file: io.BytesIO = None,
+    k_matrix_file: io.BytesIO = None,
+    l_matrix_file: io.BytesIO = None,
+    sense_to_vow_file: io.BytesIO = None
+) -> bool:
+    """5つのExcelファイルをまとめて読み込む
+    
+    Args:
+        character_file: 12神基本情報 (akiba12_character_list.xlsx)
+        maxim_file: 格言ファイル (格言.xlsx) - オプション
+        k_matrix_file: k行列 (akiba12_character_to_vow_K.xlsx)
+        l_matrix_file: l行列 (akiba12_character_to_axis_L.xlsx)
+        sense_to_vow_file: sense_to_vow行列 (sense_to_vow_initial_filled_from_user.xlsx)
+    
+    Returns:
+        True: 成功, False: 失敗
+    """
+    return load_excel_config(
+        character_file=character_file,
+        k_matrix_file=k_matrix_file,
+        l_matrix_file=l_matrix_file,
+        sense_to_vow_file=sense_to_vow_file
+    )
+
+def load_excel_config(
+    excel_file: io.BytesIO = None,
+    character_file: io.BytesIO = None,
+    k_matrix_file: io.BytesIO = None,
+    l_matrix_file: io.BytesIO = None,
+    sense_to_vow_file: io.BytesIO = None
+) -> bool:
+    """Excelファイルを読み込んでグローバル変数を更新
+    
+    Args:
+        excel_file: 1つのExcelファイル（3つのシートを含む）- 後方互換性のため
+        character_file: 12神基本情報のExcelファイル（別ファイルの場合）
+        k_matrix_file: k行列のExcelファイル（別ファイルの場合）
+        l_matrix_file: l行列のExcelファイル（別ファイルの場合）
+        sense_to_vow_file: sense_to_vow行列のExcelファイル（8感覚 × 12誓願）
+    
+    Returns:
+        True: 成功, False: 失敗
+    """
+    global SENSE_TO_VOW_MATRIX, K_MATRIX, L_MATRIX, LOADED_GODS, TWELVE_GODS
+    
+    try:
+        # 1つのファイルの場合（後方互換性）
+        if excel_file is not None:
+            gods_list, k_matrix, l_matrix = load_gods_from_excel(excel_file)
+        # 3つの別々のファイルの場合
+        elif k_matrix_file is not None and l_matrix_file is not None:
+            gods_list, k_matrix, l_matrix = load_gods_from_separate_files(
+                character_file=character_file,
+                k_matrix_file=k_matrix_file,
+                l_matrix_file=l_matrix_file
+            )
+        else:
+            raise ValueError("Excelファイルが指定されていません")
+        
+        # sense_to_vow行列を読み込む（オプション）
+        if sense_to_vow_file is not None:
+            sense_to_vow_matrix = load_sense_to_vow_matrix(sense_to_vow_file)
+            SENSE_TO_VOW_MATRIX = sense_to_vow_matrix
+        else:
+            # sense_to_vow行列がない場合、デフォルト値を設定（感覚と誓願の基本的な対応）
+            # 後でユーザーがアップロードできるように、Noneのままにしておく
+            SENSE_TO_VOW_MATRIX = None
+        
+        # グローバル変数を更新
+        K_MATRIX = k_matrix
+        L_MATRIX = l_matrix
+        LOADED_GODS = gods_list
+        TWELVE_GODS = gods_list  # 既存のコードとの互換性のため
+        rebuild_globals_from_gods(gods_list)
+        
+        return True
+    except Exception as e:
+        st.error(f"設定の読み込みに失敗しました: {str(e)}")
+        import traceback
+        st.error(f"詳細: {traceback.format_exc()}")
+        return False
+
+# -------------------------
+# QUBO生成（12神ベース）
+# -------------------------
+# QUBOパラメータ（12神同士の関係性）
 # 負の値 = 相乗効果（一緒に選ばれやすい）
 # 正の値 = 抑制（同時に選ばれにくい）
-Q_BASE: Dict[Tuple[int,int], float] = {
-    # 線形項（各格言の基本エネルギー）
-    # 負の値が大きいほど選ばれやすい
-    (0,0): -0.5,  # 静けさの格言
-    (1,1): -0.5,  # 流れの格言
-    (2,2): -0.5,  # 余白の格言
-    (3,3): -0.5,  # 誠実さの格言
-    # 相互作用項（格言同士の関係）
-    # 負の値 = 相乗効果、正の値 = 抑制効果
-    (0,1): -0.3,  # 静けさ × 流れ = 軽い相乗効果
-    (0,2): -0.4,  # 静けさ × 余白 = 相乗効果
-    (1,2): -0.3,  # 流れ × 余白 = 軽い相乗効果
-    (0,3): +0.2,  # 静けさ × 誠実 = 少し抑制（多様性のため）
-    (1,3): -0.2,  # 流れ × 誠実 = 軽い相乗効果
-    (2,3): +0.1,  # 余白 × 誠実 = わずかな抑制
-}
+
+def calculate_god_similarity(god1: Dict, god2: Dict) -> float:
+    """2つの神の属性の類似度を計算（-1.0 ～ 1.0）
+    誓願属性（vows）と役割属性（roles）の両方を考慮"""
+    # 誓願属性の類似度（vow01～vow12）
+    vow_keys = [f"vow{i:02d}" for i in range(1, 13)]
+    vow_diff_sum = 0.0
+    for key in vow_keys:
+        diff = abs(god1["vows"][key] - god2["vows"][key])
+        vow_diff_sum += diff
+    vow_similarity = 1.0 - (vow_diff_sum / len(vow_keys))
+    
+    # 役割属性の類似度
+    role_attrs = ["stillness", "flow", "ma", "sincerity"]
+    role_diff_sum = 0.0
+    for attr in role_attrs:
+        diff = abs(god1["roles"][attr] - god2["roles"][attr])
+        role_diff_sum += diff
+    role_similarity = 1.0 - (role_diff_sum / len(role_attrs))
+    
+    # 両方の類似度を重み付けして統合（誓願:0.6、役割:0.4）
+    similarity = vow_similarity * 0.6 + role_similarity * 0.4
+    return similarity
+
+def build_qubo_hierarchical(x: np.ndarray, lambda_v: float = 5.0, lambda_c: float = 5.0, 
+                            lambda_neg: float = 2.0, lambda_conf: float = 2.0,
+                            sense_to_vow_matrix: Optional[np.ndarray] = None,
+                            k_matrix: Optional[np.ndarray] = None,
+                            l_matrix: Optional[np.ndarray] = None,
+                            x_continuous: Optional[np.ndarray] = None) -> Dict[Tuple[int,int], float]:
+    """多層バイナリ構造QUBOを生成（添付資料の設計に基づく）
+    
+    Args:
+        x: 感覚ベクトル（x1～x8、バイナリ）
+        lambda_v: 誓願層のone-hot制約の強度
+        lambda_c: キャラクター層のone-hot制約の強度
+        lambda_neg: 矛盾制約の強度（迷い×行動）
+        lambda_conf: 矛盾制約の強度（焦り×待つ）
+        sense_to_vow_matrix: sense_to_vow行列（8x12：感覚 × 誓願）。Noneの場合はデフォルト値を使用
+        k_matrix: k行列（12x12：キャラクター × 誓願）。Noneの場合はTWELVE_GODSから生成
+        l_matrix: l行列（12x4：キャラクター × 世界観軸）。Noneの場合はTWELVE_GODSから生成
+        x_continuous: 感覚ベクトルの連続値（0〜5）。Noneの場合はxを使用
+    
+    Returns:
+        QUBO辞書（(i,j) -> エネルギー係数）
+    
+    設計の流れ:
+    1. ユーザー入力 → Mood → 感覚ベクトル x（8次元、連続値0〜5）
+    2. x（感覚）→ v（誓願）を引き寄せる（sense_to_vow_matrixを使用）
+       - H_sense-vow = Σ_{i,j} W_{ij} x_i v_j
+       - W_{ij}: sense_to_vow_matrix[i, j] = 感覚iが誓願jを引き寄せる強さ
+    3. v（誓願）→ c（キャラ）を引き寄せる（k_matrixを使用）
+    4. QUBOでone-hot制約により、誓願1つ、キャラ1体が選ばれる
+    """
+    Q: Dict[Tuple[int,int], float] = {}
+    
+    n_sense = len(x)  # 8（感覚変数）
+    n_vows = 12  # 12誓願
+    n_chars = 12  # 12神
+    
+    # 変数のインデックス定義
+    # x: 0～7（感覚変数）
+    # v: 8～19（誓願変数）
+    # c: 20～31（キャラクター変数）
+    v_start = n_sense
+    c_start = n_sense + n_vows
+    
+    # k行列とl行列を取得（Excelから読み込んだ場合はそれを使用、そうでなければTWELVE_GODSから生成）
+    if k_matrix is None:
+        # TWELVE_GODSからk行列を生成
+        k_matrix = np.zeros((n_chars, n_vows))
+        for k, god in enumerate(TWELVE_GODS):
+            for j in range(n_vows):
+                vow_key = f"vow{j+1:02d}"
+                k_matrix[k, j] = god["vows"][vow_key]
+    
+    if l_matrix is None:
+        # TWELVE_GODSからl行列を生成
+        l_matrix = np.zeros((n_chars, 4))
+        role_names = ["stillness", "flow", "ma", "sincerity"]
+        for k, god in enumerate(TWELVE_GODS):
+            for j, role_name in enumerate(role_names):
+                l_matrix[k, j] = god["roles"][role_name]
+    
+    # === H_sense: 感覚エネルギー項 ===
+    # H_sense = Σ_i a_i x_i
+    # 感覚が強いほど選ばれやすい（負の値でエネルギーを下げる）
+    for i in range(n_sense):
+        # 連続値の場合、強さに応じてエネルギーを下げる
+        # バイナリの場合、立ち上がっている場合のみ
+        if x[i] > 0:
+            # 感覚の強さに比例してエネルギーを下げる（負の値）
+            # ただし、感覚変数自体はバイナリなので、立ち上がっている場合のみ
+            Q[(i, i)] = -0.5 * min(x[i], 1.0)  # 最大1.0に制限
+    
+    # === H_vow: 誓願選択項（one-hot制約） ===
+    # H_vow = λ_v (Σ_j v_j - 1)^2 = λ_v (Σ_j v_j^2 - 2Σ_j v_j + 1)
+    # = λ_v (Σ_j v_j - 2Σ_j v_j + 1) = λ_v (1 - Σ_j v_j)
+    # 展開すると: λ_v * Σ_j v_j^2 - 2λ_v * Σ_j v_j + λ_v
+    # 線形項: -2λ_v * v_j
+    # 二次項: λ_v * v_j^2 (j=jの場合) + λ_v * 2 * v_i * v_j (i≠jの場合)
+    for j in range(n_vows):
+        v_idx = v_start + j
+        # 線形項
+        Q[(v_idx, v_idx)] = -2.0 * lambda_v
+        # 二次項（誓願同士の相互作用）
+        for k in range(j+1, n_vows):
+            v_idx2 = v_start + k
+            Q[(v_idx, v_idx2)] = 2.0 * lambda_v
+    
+    # 定数項（λ_v）は無視（エネルギー差のみが重要）
+    
+    # === H_char: キャラクター選択項（one-hot制約） ===
+    # H_char = λ_c (Σ_k c_k - 1)^2
+    for k in range(n_chars):
+        c_idx = c_start + k
+        # 線形項
+        Q[(c_idx, c_idx)] = -2.0 * lambda_c
+        # 二次項（キャラクター同士の相互作用）
+        for l in range(k+1, n_chars):
+            c_idx2 = c_start + l
+            Q[(c_idx, c_idx2)] = 2.0 * lambda_c
+    
+    # === H_interaction: 相互作用項 ===
+    # H_interaction = Σ_{i,j} S_{ij} x_i v_j + Σ_{j,k} K_{jk} v_j c_k + Σ_{i,k} L_{ik} x_i c_k
+    
+    # 感覚 × 誓願: S_{ij} x_i v_j（sense_to_vow_matrixを使用）
+    # H_sense-vow = Σ_{i,j} W_{ij} x_i v_j
+    # W_{ij}: sense_to_vow_matrix[i, j] = 感覚iが誓願jを引き寄せる強さ
+    # 負の値（例：-0.4）= 引き寄せ（相性が良い）→ エネルギーを下げる
+    # 正の値（例：+0.2）= 離す（相性が悪い）→ エネルギーを上げる
+    if sense_to_vow_matrix is not None:
+        # sense_to_vow行列を使用（中核データ）
+        for i in range(n_sense):
+            if x[i] > 0:  # 感覚が立ち上がっている場合のみ
+                for j in range(n_vows):
+                    v_idx = v_start + j
+                    # sense_to_vow行列の値を直接使用
+                    if i < sense_to_vow_matrix.shape[0] and j < sense_to_vow_matrix.shape[1]:
+                        W_ij = sense_to_vow_matrix[i, j]  # 感覚iが誓願jを引き寄せる強さ
+                        # QUBOの相互作用項: W_{ij} * x_i * v_j
+                        # x_iはバイナリ変数だが、連続値の強さを重みとして使用
+                        if x_continuous is not None and i < len(x_continuous):
+                            x_strength = min(x_continuous[i], 5.0) / 5.0  # 0〜1に正規化
+                        else:
+                            x_strength = 1.0 if x[i] > 0 else 0.0
+                        # W_{ij} * x_i * v_j の係数
+                        # 負の値 = 引き寄せ（エネルギーを下げる）、正の値 = 離す（エネルギーを上げる）
+                        Q[(i, v_idx)] = W_ij * x_strength
+    else:
+        # sense_to_vow行列がない場合、デフォルトの対応関係を使用
+        # 迷いが強い → 誓願05/07/10が呼ばれやすい、など
+        default_mapping = {
+            0: [4, 6, 9],  # 迷い → 誓願05, 07, 10
+            1: [0, 1, 3],  # 焦り → 誓願01, 02, 04
+            2: [1, 10],    # 静けさ → 誓願02, 11
+            3: [2, 8],     # 内省 → 誓願03, 09
+            4: [3, 5],     # 行動 → 誓願04, 06
+            5: [7, 11],    # つながり → 誓願08, 12
+            6: [4, 6],     # 挑戦 → 誓願05, 07
+            7: [2, 8],     # 待つ → 誓願03, 09
+        }
+        for i in range(n_sense):
+            if x[i] > 0:
+                for j in range(n_vows):
+                    v_idx = v_start + j
+                    # デフォルトマッピングを使用
+                    if i in default_mapping and j in default_mapping[i]:
+                        Q[(i, v_idx)] = -0.3 * x[i]  # 負の値で引き寄せる
+                    else:
+                        Q[(i, v_idx)] = 0.1 * x[i]  # 正の値で少し抑制
+    
+    # 誓願 × キャラクター: K_{jk} v_j c_k = k_matrix[k, j] v_j c_k
+    # k行列を使用して誓願とキャラクターの相互作用を定義
+    # この誓願なら、この神が「語り手として自然」という関係を数値で持っている
+    for j in range(n_vows):
+        v_idx = v_start + j
+        for k in range(n_chars):
+            c_idx = c_start + k
+            # k行列の値を使用（キャラクターkの誓願jの値）
+            # 負の値 = その誓願が選ばれやすい、正の値 = 選ばれにくい
+            if k < k_matrix.shape[0] and j < k_matrix.shape[1]:
+                Q[(v_idx, c_idx)] = k_matrix[k, j]
+    
+    # 感覚 × キャラクター: L_{ik} x_i c_k = l_matrix[k, role_i] x_i c_k
+    # l行列を使用して感覚とキャラクターの相互作用を定義
+    # 感覚変数と役割属性のマッピング
+    role_mapping = {
+        0: 0,  # 迷い → stillness (l_matrixの列0)
+        1: 1,  # 焦り → flow (l_matrixの列1)
+        2: 0,  # 静けさ → stillness (l_matrixの列0)
+        3: 2,  # 内省 → ma (l_matrixの列2)
+        4: 1,  # 行動 → flow (l_matrixの列1)
+        5: 2,  # つながり → ma (l_matrixの列2)
+        6: 1,  # 挑戦 → flow (l_matrixの列1)
+        7: 3,  # 待つ → sincerity (l_matrixの列3)
+    }
+    
+    for i in range(n_sense):
+        if x[i] > 0:
+            role_col = role_mapping.get(i, 0)
+            for k in range(n_chars):
+                c_idx = c_start + k
+                # l行列の値を使用（キャラクターkの役割属性role_colの値）
+                Q[(i, c_idx)] = l_matrix[k, role_col] * x[i]
+    
+    # === H_constraint: 制約項 ===
+    # H_constraint = λ_neg (x_迷い・x_行動) + λ_conf (x_焦り・x_待つ)
+    # 迷い（x0）と行動（x4）の矛盾
+    if x[0] > 0 and x[4] > 0:
+        Q[(0, 4)] = lambda_neg
+    
+    # 焦り（x1）と待つ（x7）の矛盾
+    if x[1] > 0 and x[7] > 0:
+        Q[(1, 7)] = lambda_conf
+    
+    return Q
+
+def build_qubo_base() -> Dict[Tuple[int,int], float]:
+    """従来のQUBOベース（後方互換性のため）"""
+    # デフォルトの感覚ベクトル（全て0）でQUBOを生成
+    x_default = np.zeros(8)
+    return build_qubo_hierarchical(x_default)
+
+# 基本QUBOパラメータを生成
+Q_BASE = build_qubo_base()
 
 def clamp(v: float, lo: float=-3.0, hi: float=3.0) -> float:
     return max(lo, min(hi, v))
 
-def build_qubo_from_mood(m: Mood) -> Dict[Tuple[int,int], float]:
-    """Moodに基づいてQUBOパラメータを調整（改善版：連続的で多様な変化）"""
-    Q = dict(Q_BASE)
+def select_god_from_mood(m: Mood) -> Dict:
+    """Moodに基づいて最も適した12神の1つを選択
+    役割属性（roles）を主に考慮（新しい誓願構造に対応）"""
+    best_god = None
+    best_score = -float('inf')
     
-    # 閾値を下げて、より小さなMood値でも反応するようにする
-    # また、Mood値に比例して連続的に調整する
+    for god in TWELVE_GODS:
+        # Moodと神の役割属性の類似度を計算
+        score = 0.0
+        
+        # 疲れが高い → 静（stillness）が高い神を選ぶ
+        if m.fatigue > 0.3:
+            score += abs(god["roles"]["stillness"]) * m.fatigue * 0.3
+        
+        # 不安が高い → 流（flow）が高い神を選ぶ
+        if m.anxiety > 0.3:
+            score += abs(god["roles"]["flow"]) * m.anxiety * 0.3
+        
+        # 好奇心が高い → 間（ma）が高い神を選ぶ
+        if m.curiosity > 0.3:
+            score += abs(god["roles"]["ma"]) * m.curiosity * 0.3
+        
+        # 決断力が高い → 誠（sincerity）が高い神を選ぶ
+        if m.decisiveness > 0.3:
+            score += abs(god["roles"]["sincerity"]) * m.decisiveness * 0.3
+        
+        # 孤独感が高い → 間（ma）と静（stillness）が高い神を選ぶ
+        if m.loneliness > 0.3:
+            score += (abs(god["roles"]["ma"]) + abs(god["roles"]["stillness"])) * m.loneliness * 0.2
+        
+        if score > best_score:
+            best_score = score
+            best_god = god
     
-    # === 線形項の調整（各格言の選択されやすさ） ===
+    return best_god if best_god else TWELVE_GODS[0]
+
+def build_qubo_from_mood(m: Mood, 
+                         sense_to_vow_matrix: Optional[np.ndarray] = None,
+                         k_matrix: Optional[np.ndarray] = None,
+                         l_matrix: Optional[np.ndarray] = None) -> Dict[Tuple[int,int], float]:
+    """Moodに基づいて多層バイナリ構造QUBOを生成
     
-    # 疲れ → 静けさ(0)と余白(2)の格言が選ばれやすく、流れ(1)は少し抑制
-    fatigue_effect = m.fatigue * 1.5  # 効果を強化
-    Q[(0,0)] = clamp(Q[(0,0)] - fatigue_effect)  # 静けさ
-    Q[(2,2)] = clamp(Q[(2,2)] - fatigue_effect * 0.9)  # 余白
-    Q[(1,1)] = clamp(Q[(1,1)] + m.fatigue * 0.3)  # 流れは少し抑制
+    設計の流れ:
+    1. ユーザー入力 → Mood → 感覚ベクトル x（8次元、連続値0〜5）
+    2. x（感覚）→ v（誓願）を引き寄せる（sense_to_vow_matrixを使用）
+       - H_sense-vow = Σ_{i,j} W_{ij} x_i v_j
+       - W_{ij}: sense_to_vow_matrix[i, j] = 感覚iが誓願jを引き寄せる強さ
+    3. v（誓願）→ c（キャラ）を引き寄せる（k_matrixを使用）
+    4. QUBOでone-hot制約により、誓願1つ、キャラ1体が選ばれる
     
-    # 不安 → 流れ(1)と誠実(3)の格言が選ばれやすく、静けさ(0)も支援
-    anxiety_effect = m.anxiety * 1.4
-    Q[(1,1)] = clamp(Q[(1,1)] - anxiety_effect)  # 流れ
-    Q[(3,3)] = clamp(Q[(3,3)] - anxiety_effect * 0.8)  # 誠実
-    Q[(0,0)] = clamp(Q[(0,0)] - m.anxiety * 0.5)  # 静けさも支援
+    Args:
+        m: Moodオブジェクト
+        sense_to_vow_matrix: sense_to_vow行列（8x12：感覚 × 誓願）
+        k_matrix: k行列（12x12：キャラクター × 誓願）
+        l_matrix: l行列（12x4：キャラクター × 世界観軸）
     
-    # 好奇心 → 流れ(1)と余白(2)の格言が選ばれやすく、誠実(3)も支援
-    curiosity_effect = m.curiosity * 1.3
-    Q[(1,1)] = clamp(Q[(1,1)] - curiosity_effect * 0.9)  # 流れ
-    Q[(2,2)] = clamp(Q[(2,2)] - curiosity_effect)  # 余白
-    Q[(3,3)] = clamp(Q[(3,3)] - m.curiosity * 0.4)  # 誠実も支援
+    Returns:
+        QUBO辞書（(i,j) -> エネルギー係数）
+    """
+    # Moodから感覚ベクトルを生成（連続値0〜5として扱う）
+    # ただし、QUBO変数はバイナリなので、感覚の強さは重みとして使用
+    x_continuous = mood_to_sensation_vector(m, binary=False, scale=5.0)
+    # QUBO構築時は、感覚が立ち上がっているかどうかをバイナリで判定
+    x = (x_continuous > 0.3).astype(float)  # 閾値0.3*5=1.5以上で1
     
-    # 孤独感 → 静けさ(0)と誠実(3)の格言が選ばれやすく、余白(2)も支援
-    loneliness_effect = m.loneliness * 1.2
-    Q[(0,0)] = clamp(Q[(0,0)] - loneliness_effect)  # 静けさ
-    Q[(3,3)] = clamp(Q[(3,3)] - loneliness_effect * 0.7)  # 誠実
-    Q[(2,2)] = clamp(Q[(2,2)] - m.loneliness * 0.4)  # 余白も支援
+    # グローバル変数から行列を取得（指定されていない場合）
+    if sense_to_vow_matrix is None:
+        sense_to_vow_matrix = SENSE_TO_VOW_MATRIX
+    if k_matrix is None:
+        k_matrix = K_MATRIX
+    if l_matrix is None:
+        l_matrix = L_MATRIX
     
-    # 決断力 → 低い場合は誠実(3)と静けさ(0)、高い場合は流れ(1)と余白(2)
-    decisiveness_factor = (1.0 - m.decisiveness) * 1.2  # 低いほど効果大
-    Q[(3,3)] = clamp(Q[(3,3)] - decisiveness_factor)  # 決断力が低い→誠実を強調
-    Q[(0,0)] = clamp(Q[(0,0)] - decisiveness_factor * 0.6)  # 静けさも
-    
-    if m.decisiveness > 0.5:  # 決断力が高い場合
-        Q[(1,1)] = clamp(Q[(1,1)] - (m.decisiveness - 0.5) * 1.0)  # 流れ
-        Q[(2,2)] = clamp(Q[(2,2)] - (m.decisiveness - 0.5) * 0.8)  # 余白
-    
-    # === 相互作用項の動的調整（組み合わせの相乗効果） ===
-    
-    # 疲れ×不安 → 静けさ×余白の相乗効果を強化
-    if m.fatigue > 0.2 and m.anxiety > 0.2:
-        synergy = (m.fatigue + m.anxiety) / 2 * 0.6
-        Q[(0,2)] = clamp(Q[(0,2)] - synergy)  # 静けさ × 余白
-    
-    # 不安×好奇心 → 流れ×余白の相乗効果
-    if m.anxiety > 0.2 and m.curiosity > 0.2:
-        synergy = (m.anxiety + m.curiosity) / 2 * 0.5
-        Q[(1,2)] = clamp(Q[(1,2)] - synergy)  # 流れ × 余白
-    
-    # 不安×決断力(高) → 流れ×誠実の相乗効果
-    if m.anxiety > 0.2 and m.decisiveness > 0.5:
-        synergy = m.anxiety * (m.decisiveness - 0.5) * 0.7
-        Q[(1,3)] = clamp(Q[(1,3)] - synergy)  # 流れ × 誠実
-    
-    # 孤独感×疲れ → 静けさ×誠実の相乗効果
-    if m.loneliness > 0.2 and m.fatigue > 0.2:
-        synergy = (m.loneliness + m.fatigue) / 2 * 0.5
-        Q[(0,3)] = clamp(Q[(0,3)] - synergy)  # 静けさ × 誠実（元々は抑制だったが、Moodに応じて変化）
-    
-    # 好奇心×決断力(高) → 流れ×余白の相乗効果を強化
-    if m.curiosity > 0.3 and m.decisiveness > 0.5:
-        synergy = m.curiosity * (m.decisiveness - 0.5) * 0.6
-        Q[(1,2)] = clamp(Q[(1,2)] - synergy)  # 流れ × 余白
+    # 多層バイナリ構造QUBOを生成
+    # x_continuousを渡して、感覚の強さを重みとして使用
+    Q = build_qubo_hierarchical(x, 
+                                 sense_to_vow_matrix=sense_to_vow_matrix,
+                                 k_matrix=k_matrix, 
+                                 l_matrix=l_matrix,
+                                 x_continuous=x_continuous)
     
     return Q
 
 # -------------------------
 # 解探索
 # -------------------------
-def solve_all(Q: Dict[Tuple[int,int], float]) -> List[Tuple[float, np.ndarray]]:
-    n = len(VARIABLES)
+def solve_all_with_optuna(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False, 
+                          progress_container=None, n_trials: int = 100):
+    """Optunaを使ったQUBO最適化（進捗表示付き）
+    
+    Args:
+        Q: QUBO辞書
+        use_hierarchical: 多層バイナリ構造を使用する場合True
+        progress_container: Streamlitのコンテナ（進捗表示用）
+        n_trials: 試行回数
+    
+    Returns:
+        (解のリスト, Optuna Study)
+    """
+    if not OPTUNA_AVAILABLE:
+        # Optunaが使えない場合は通常のsolve_allを使用
+        if progress_container is not None:
+            with progress_container:
+                st.info("ℹ️ Optunaが利用できません。通常の最適化を使用します。")
+        return solve_all(Q, use_hierarchical), None
+    
+    if use_hierarchical:
+        n = 32
+        v_start = 8
+        c_start = 20
+    else:
+        n = len(VARIABLES)
+        v_start = None
+        c_start = None
+    
+    # Optuna Studyを作成（in-memory database）
+    study = optuna.create_study(direction='minimize', study_name='qubo_optimization')
+    
+    def objective(trial):
+        # バイナリ変数を生成
+        if use_hierarchical:
+            # one-hot制約を満たすように生成
+            # 誓願変数: 12個のうち1つだけ1
+            vow_idx = trial.suggest_int('vow_idx', 0, 11)
+            # キャラクター変数: 12個のうち1つだけ1
+            char_idx = trial.suggest_int('char_idx', 0, 11)
+            
+            x = np.zeros(n, dtype=int)
+            x[v_start + vow_idx] = 1
+            x[c_start + char_idx] = 1
+            
+            # 感覚変数はランダムに設定
+            for i in range(8):
+                x[i] = trial.suggest_int(f'sense_{i}', 0, 1)
+        else:
+            x = np.zeros(n, dtype=int)
+            for i in range(n):
+                x[i] = trial.suggest_int(f'x_{i}', 0, 1)
+        
+        # エネルギーを計算
+        energy = qubo_energy(x, Q)
+        
+        # 進捗表示
+        if progress_container is not None:
+            with progress_container:
+                st.write(f"試行 {trial.number + 1}/{n_trials}: エネルギー = {energy:.3f}")
+        
+        return energy
+    
+    # 最適化実行
+    if progress_container is not None:
+        with progress_container:
+            st.info("🔮 QUBO最適化を実行中...")
+            progress_bar = st.progress(0)
+    
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    # 最適解を取得
+    best_x = np.zeros(n, dtype=int)
+    if use_hierarchical:
+        best_vow = study.best_params['vow_idx']
+        best_char = study.best_params['char_idx']
+        best_x[v_start + best_vow] = 1
+        best_x[c_start + best_char] = 1
+        for i in range(8):
+            best_x[i] = study.best_params[f'sense_{i}']
+    else:
+        for i in range(n):
+            best_x[i] = study.best_params[f'x_{i}']
+    
+    # 解のリストを作成（最適解とその周辺）
+    sols = [(study.best_value, best_x)]
+    
+    # 追加の解を生成（トライアルから）
+    for trial in study.trials[:min(100, len(study.trials))]:
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            x = np.zeros(n, dtype=int)
+            if use_hierarchical:
+                x[v_start + trial.params['vow_idx']] = 1
+                x[c_start + trial.params['char_idx']] = 1
+                for i in range(8):
+                    x[i] = trial.params[f'sense_{i}']
+            else:
+                for i in range(n):
+                    x[i] = trial.params[f'x_{i}']
+            sols.append((trial.value, x))
+    
+    sols.sort(key=lambda t: t[0])
+    
+    if progress_container is not None:
+        with progress_container:
+            st.success(f"✅ 最適化完了！最適エネルギー: {study.best_value:.3f}")
+    
+    return sols, study
+
+def solve_all(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False) -> List[Tuple[float, np.ndarray]]:
+    """QUBOの全解を探索
+    
+    Args:
+        Q: QUBO辞書
+        use_hierarchical: 多層バイナリ構造を使用する場合True
+    """
+    if use_hierarchical:
+        # 多層バイナリ構造の場合
+        # 変数の総数: 8（感覚）+ 12（誓願）+ 12（キャラクター）= 32
+        n = 32
+        v_start = 8  # 誓願変数の開始インデックス
+        c_start = 20  # キャラクター変数の開始インデックス
+    else:
+        # 従来の構造の場合
+        n = len(VARIABLES)
+        v_start = None
+        c_start = None
+    
     sols = []
-    for bits in itertools.product([0,1], repeat=n):
-        x = np.array(bits, dtype=int)
-        e = qubo_energy(x, Q)
-        sols.append((e, x))
+    # 全探索は計算量が大きいため、ランダムサンプリングまたはヒューリスティックを使用
+    # ここでは簡易的に全探索を実装（実際の運用では最適化が必要）
+    max_samples = 2**min(n, 16)  # 2^16 = 65536まで
+    if n <= 16:
+        for bits in itertools.product([0,1], repeat=n):
+            x = np.array(bits, dtype=int)
+            # one-hot制約をチェック（階層構造の場合）
+            if use_hierarchical:
+                # 誓願変数（8〜19）のone-hot制約
+                vow_sum = np.sum(x[v_start:v_start+12])
+                # キャラクター変数（20〜31）のone-hot制約
+                char_sum = np.sum(x[c_start:c_start+12])
+                # one-hot制約を満たす解のみを追加（厳密に1つだけ選ばれている）
+                if vow_sum == 1 and char_sum == 1:
+                    e = qubo_energy(x, Q)
+                    sols.append((e, x))
+            else:
+                e = qubo_energy(x, Q)
+                sols.append((e, x))
+    else:
+        # 大きい場合はランダムサンプリング（one-hot制約を満たす解のみ）
+        valid_samples = 0
+        max_attempts = 50000  # 最大試行回数
+        attempts = 0
+        
+        while valid_samples < min(10000, max_samples) and attempts < max_attempts:
+            attempts += 1
+            x = np.random.randint(0, 2, size=n, dtype=int)
+            
+            # one-hot制約をチェック（階層構造の場合）
+            if use_hierarchical:
+                # 誓願変数（8〜19）のone-hot制約
+                vow_sum = np.sum(x[v_start:v_start+12])
+                # キャラクター変数（20〜31）のone-hot制約
+                char_sum = np.sum(x[c_start:c_start+12])
+                # one-hot制約を満たす解のみを追加（厳密に1つだけ選ばれている）
+                if vow_sum == 1 and char_sum == 1:
+                    e = qubo_energy(x, Q)
+                    sols.append((e, x))
+                    valid_samples += 1
+            else:
+                e = qubo_energy(x, Q)
+                sols.append((e, x))
+                valid_samples += 1
+        
+        # one-hot制約を満たす解が少ない場合、制約を緩和
+        if len(sols) < 10 and use_hierarchical:
+            # 制約を緩和して追加の解を生成
+            for _ in range(min(1000, max_samples - len(sols))):
+                x = np.random.randint(0, 2, size=n, dtype=int)
+                # 誓願とキャラクターのどちらかが選ばれていればOK（緩和）
+                vow_sum = np.sum(x[v_start:v_start+12])
+                char_sum = np.sum(x[c_start:c_start+12])
+                if vow_sum >= 1 and char_sum >= 1:
+                    e = qubo_energy(x, Q)
+                    sols.append((e, x))
+    
     sols.sort(key=lambda t: t[0])
     return sols
 
@@ -419,11 +1461,65 @@ def solve_all(Q: Dict[Tuple[int,int], float]) -> List[Tuple[float, np.ndarray]]:
 # ボルツマンサンプリング
 # -------------------------
 def boltzmann_sample(cands: List[Tuple[float, np.ndarray]], T: float) -> Tuple[float, np.ndarray]:
+    """ボルツマンサンプリングで候補から1つを選択
+    
+    Args:
+        cands: 候補リスト（(エネルギー, 解ベクトル)のタプルのリスト）
+        T: 温度パラメータ
+    
+    Returns:
+        選ばれた候補（(エネルギー, 解ベクトル)のタプル）
+    """
+    if not cands:
+        raise ValueError("候補が空です")
+    
+    if len(cands) == 1:
+        return cands[0]
+    
+    # エネルギー値を取得
     es = np.array([e for e,_ in cands], dtype=float)
-    es0 = es - es.min()
-    weights = np.exp(-es0 / max(T, 1e-9))
-    weights = weights / weights.sum()
-    idx = np.random.choice(len(cands), p=weights)
+    
+    # NaNやInfをチェック
+    if np.any(np.isnan(es)) or np.any(np.isinf(es)):
+        # NaNやInfがある場合、最初の候補を返す
+        return cands[0]
+    
+    # 温度の最小値を確保
+    T = max(T, 1e-6)
+    
+    # エネルギーを正規化（最小値を0に）
+    es_min = es.min()
+    es0 = es - es_min
+    
+    # 重みを計算（ボルツマン分布）
+    # エネルギーが大きすぎる場合を防ぐため、最大値を制限
+    es0_clamped = np.clip(es0, 0, 100)  # 最大100に制限
+    weights = np.exp(-es0_clamped / T)
+    
+    # NaNやInfをチェック
+    if np.any(np.isnan(weights)) or np.any(np.isinf(weights)):
+        # 均等な重みを使用
+        weights = np.ones(len(cands)) / len(cands)
+    else:
+        # 正規化
+        weights_sum = weights.sum()
+        if weights_sum == 0 or np.isnan(weights_sum) or np.isinf(weights_sum):
+            # 合計が0またはNaN/Infの場合、均等な重みを使用
+            weights = np.ones(len(cands)) / len(cands)
+        else:
+            weights = weights / weights_sum
+    
+    # 最終的なNaNチェック
+    if np.any(np.isnan(weights)):
+        weights = np.ones(len(cands)) / len(cands)
+    
+    # サンプリング
+    try:
+        idx = np.random.choice(len(cands), p=weights)
+    except ValueError as e:
+        # 重みの合計が1でない場合など、均等サンプリングにフォールバック
+        idx = np.random.randint(0, len(cands))
+    
     return cands[idx]
 
 def temperature_from_mood(m: Mood) -> float:
@@ -449,24 +1545,229 @@ def temperature_from_mood(m: Mood) -> float:
 # -------------------------
 # おみくじ生成
 # -------------------------
-def picks_from_x(x: np.ndarray) -> List[str]:
-    """選ばれた格言を返す"""
-    p = [VARIABLES[i] for i,v in enumerate(x) if v==1]
-    return p if p else ["今この瞬間を大切に。すべては縁で繋がっている。"]
+def picks_from_x(x: np.ndarray, use_hierarchical: bool = False, selected_god: Dict = None) -> List[str]:
+    """選ばれた格言を返す
+    
+    Args:
+        x: 解ベクトル
+        use_hierarchical: 多層バイナリ構造を使用する場合True
+        selected_god: 既に選ばれた神の情報（オプション、階層構造の場合に使用）
+    """
+    if use_hierarchical:
+        # 階層構造の場合、キャラクター変数から選ばれた神を取得
+        # 解ベクトルのサイズを確認（32である必要がある）
+        if len(x) < 32:
+            # サイズが足りない場合、selected_godから取得を試みる
+            if selected_god and selected_god.get("maxim"):
+                return [selected_god["maxim"]]
+            return ["今この瞬間を大切に。すべては縁で繋がっている。"]
+        
+        c_start = 20
+        selected_god_ids = [i - c_start for i in range(c_start, min(c_start + 12, len(x))) if i < len(x) and x[i] == 1]
+        
+        # キャラクター変数から選ばれた神を取得
+        if selected_god_ids and 0 <= selected_god_ids[0] < len(TWELVE_GODS):
+            god = TWELVE_GODS[selected_god_ids[0]]
+            if god.get("maxim"):
+                return [god["maxim"]]
+            elif god.get("description"):
+                return [god["description"]]
+            else:
+                return ["今この瞬間を大切に。すべては縁で繋がっている。"]
+        elif selected_god:
+            # キャラクター変数から選ばれていない場合、selected_godから取得
+            if selected_god.get("maxim"):
+                return [selected_god["maxim"]]
+            elif selected_god.get("description"):
+                return [selected_god["description"]]
+        
+        # デフォルトの格言を返す
+        return ["今この瞬間を大切に。すべては縁で繋がっている。"]
+    else:
+        # 従来の構造の場合
+        max_idx = min(len(x), len(VARIABLES))
+        p = [VARIABLES[i] for i in range(max_idx) if x[i] == 1]
+        return p if p else ["今この瞬間を大切に。すべては縁で繋がっている。"]
 
 def get_maxim_source(maxim: str) -> Dict:
     """格言の引用元情報を取得"""
     if maxim in MAXIM_SOURCES:
         return MAXIM_SOURCES[maxim]
+    # 有名引用（FAMOUS_QUOTES）も参照
+    try:
+        for q in FAMOUS_QUOTES:
+            if q.get("quote") == maxim:
+                return {
+                    "source": q.get("source", "引用"),
+                    "origin": q.get("origin", ""),
+                    "reference": q.get("reference", ""),
+                }
+    except Exception:
+        pass
     return {
         "source": "伝統的な教え",
         "origin": "古来より伝わる智慧",
         "reference": "長い年月をかけて受け継がれてきた知恵"
     }
 
-def oracle_card(e: float, x: np.ndarray, mood: Mood = None) -> Dict:
-    """格言ベースのおみくじカードを生成（Moodに応じて変化）"""
-    picks = picks_from_x(x)
+def select_maxims_for_god(
+    god: Dict,
+    context_text: str,
+    top_k: int = 2,
+    include_famous_quote: bool = True
+) -> List[str]:
+    """ユーザー入力（context_text）に応じて、神（キャラクター）の複数格言を選ぶ"""
+    if not god:
+        return ["今この瞬間を大切に。すべては縁で繋がっている。"]
+
+    ctx = (context_text or "").strip()
+    keywords = extract_keywords_safe(ctx, top_n=6) if ctx else []
+
+    # 候補（maxims があればそれを、なければ maxim/description）
+    maxims = god.get("maxims") or []
+    items: List[Dict[str, object]] = []
+    for it in maxims:
+        if isinstance(it, dict) and it.get("text"):
+            items.append({"text": str(it["text"]).strip(), "tags": it.get("tags") or []})
+
+    if not items:
+        base = (god.get("maxim") or "").strip()
+        if base:
+            items = [{"text": base, "tags": []}]
+        else:
+            desc = (god.get("description") or "").strip()
+            items = [{"text": desc or "今この瞬間を大切に。すべては縁で繋がっている。", "tags": []}]
+
+    def score_item(item: Dict[str, object]) -> float:
+        text = str(item.get("text", "") or "")
+        tags = [str(t) for t in (item.get("tags") or [])]
+        if not keywords:
+            return 0.0
+        s = 0.0
+        # タグ一致を強めに
+        for kw in keywords:
+            if kw in tags:
+                s += 3.0
+            if kw and kw in text:
+                s += 1.0
+        # 文章が短すぎる場合は少し減点
+        if len(text) < 6:
+            s -= 0.5
+        return s
+
+    scored = [(score_item(it), it["text"]) for it in items if it.get("text")]
+    # スコアが同点ならランダムに揺らぐ
+    random.shuffle(scored)
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    picks: List[str] = []
+    for s, t in scored:
+        if t and t not in picks:
+            picks.append(t)
+        if len(picks) >= max(1, top_k):
+            break
+
+    # 全部スコア0（=キーワードに引っかからない）なら、ランダムに複数提示
+    if scored and scored[0][0] <= 0.0:
+        all_texts = [t for _, t in scored if t]
+        random.shuffle(all_texts)
+        picks = list(dict.fromkeys(all_texts))[:max(1, top_k)]
+
+    # 有名名言も1つ混ぜる（任意）
+    if include_famous_quote and keywords:
+        famous = select_relevant_quote(keywords)
+        if famous and famous not in picks:
+            picks.append(famous)
+
+    return picks if picks else ["今この瞬間を大切に。すべては縁で繋がっている。"]
+
+def get_selected_god_from_x(x: np.ndarray, mood: Mood = None, use_hierarchical: bool = False) -> Dict:
+    """選ばれた神を取得
+    
+    Args:
+        x: 解ベクトル
+        mood: Moodオブジェクト（オプション）
+        use_hierarchical: 多層バイナリ構造を使用する場合True
+    """
+    if use_hierarchical:
+        # 多層バイナリ構造の場合
+        # 解ベクトルのサイズを確認（32である必要がある）
+        if len(x) < 32:
+            # サイズが足りない場合、Moodから選択するかデフォルトを返す
+            if mood is not None:
+                return select_god_from_mood(mood)
+            else:
+                return TWELVE_GODS[0]  # デフォルト
+        
+        # キャラクター変数のインデックス: 20～31
+        c_start = 20
+        selected_god_ids = [i - c_start for i in range(c_start, min(c_start + 12, len(x))) if i < len(x) and x[i] == 1]
+    else:
+        # 従来の構造の場合
+        max_idx = min(len(x), len(TWELVE_GODS))
+        selected_god_ids = [i for i in range(max_idx) if x[i] == 1]
+    
+    if not selected_god_ids:
+        # 何も選ばれていない場合、Moodから最も適した神を選択
+        if mood is not None:
+            return select_god_from_mood(mood)
+        else:
+            return TWELVE_GODS[0]  # デフォルト
+    
+    # 選ばれた神の中で、Moodに最も近い神を選択
+    if mood is not None:
+        best_god = None
+        best_score = -float('inf')
+        for god_id in selected_god_ids:
+            if 0 <= god_id < len(TWELVE_GODS):
+                god = TWELVE_GODS[god_id]
+                # 新しい誓願構造（vow01～vow12）では、Moodとの直接比較が難しいため
+                # 役割属性（roles）を使用して類似度を計算
+                score = 0.0
+                # 役割属性の類似度
+                if mood.fatigue > 0.5:
+                    score += abs(god["roles"]["stillness"]) * 0.25
+                if mood.anxiety > 0.5:
+                    score += abs(god["roles"]["flow"]) * 0.25
+                if mood.curiosity > 0.5:
+                    score += abs(god["roles"]["ma"]) * 0.25
+                if mood.decisiveness > 0.5:
+                    score += abs(god["roles"]["sincerity"]) * 0.25
+                
+                if score > best_score:
+                    best_score = score
+                    best_god = god
+        return best_god if best_god else TWELVE_GODS[selected_god_ids[0]]
+    else:
+        # Moodがない場合、最初に選ばれた神を返す
+        return TWELVE_GODS[selected_god_ids[0]] if selected_god_ids[0] < len(TWELVE_GODS) else TWELVE_GODS[0]
+
+def oracle_card(
+    e: float,
+    x: np.ndarray,
+    mood: Mood = None,
+    use_hierarchical: bool = False,
+    context_text: str = ""
+) -> Dict:
+    """格言ベースのおみくじカードを生成（Moodに応じて変化、12神対応）"""
+    # 選ばれた神を取得（先に取得して、格言も取得）
+    selected_god = get_selected_god_from_x(x, mood, use_hierarchical=use_hierarchical)
+    
+    # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
+    if use_hierarchical:
+        picks = select_maxims_for_god(selected_god, context_text=context_text, top_k=2, include_famous_quote=True)
+    else:
+        picks = picks_from_x(x, use_hierarchical=use_hierarchical, selected_god=selected_god)
+    
+    # 格言が空またはデフォルトの場合、選ばれた神の格言を使用
+    if not picks or (len(picks) == 1 and picks[0] == "今この瞬間を大切に。すべては縁で繋がっている。"):
+        if selected_god and selected_god.get("maxim"):
+            picks = [selected_god["maxim"]]
+        elif selected_god and selected_god.get("description"):
+            picks = [selected_god["description"]]
+        else:
+            picks = ["今この瞬間を大切に。すべては縁で繋がっている。"]
+    
     season = random.choice(SEASONS)
     
     # Moodに応じて「次の一歩」を選択
@@ -501,7 +1802,8 @@ def oracle_card(e: float, x: np.ndarray, mood: Mood = None) -> Dict:
         "energy": e,
         "picks": picks,
         "poem": poem,
-        "hint": hint
+        "hint": hint,
+        "god": selected_god  # 選ばれた神の情報を追加
     }
 
 # -------------------------
@@ -610,6 +1912,116 @@ def select_relevant_quote(keywords: List[str]) -> str:
     return best_match
 
 # -------------------------
+# キャラクター表示
+# -------------------------
+def render_god_character(god: Dict) -> str:
+    """選ばれた神のキャラクターをHTMLで表示"""
+    god_name = god["name"]
+    god_emoji = god["emoji"]
+    god_description = god["description"]
+    
+    # f-stringを使わず、通常の文字列でHTMLを生成（CSSの{}をエスケープする必要がない）
+    character_html = """
+    <div id="god-character-container" style="
+        position: relative;
+        width: 100%;
+        height: 400px;
+        background: linear-gradient(180deg, #0a0a1a 0%, #1a1a2e 50%, #0a0a1a 100%);
+        border-radius: 15px;
+        overflow: hidden;
+        margin: 20px 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 30px rgba(255, 215, 0, 0.3);
+    ">
+        <style>
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(30px) scale(0.9); }
+                to { opacity: 1; transform: translateY(0) scale(1); }
+            }
+            
+            @keyframes float {
+                0%, 100% { transform: translateY(0px) rotate(0deg); }
+                25% { transform: translateY(-15px) rotate(-2deg); }
+                50% { transform: translateY(-25px) rotate(0deg); }
+                75% { transform: translateY(-15px) rotate(2deg); }
+            }
+            
+            @keyframes glow {
+                0%, 100% { 
+                    text-shadow: 0 0 10px rgba(255, 215, 0, 0.5), 
+                                0 0 20px rgba(255, 215, 0, 0.3),
+                                0 0 30px rgba(255, 215, 0, 0.1); 
+                }
+                50% { 
+                    text-shadow: 0 0 20px rgba(255, 215, 0, 0.8), 
+                                0 0 30px rgba(255, 215, 0, 0.5),
+                                0 0 40px rgba(255, 215, 0, 0.3); 
+                }
+            }
+            
+            @keyframes sparkle {
+                0%, 100% { opacity: 0; transform: scale(0) rotate(0deg); }
+                50% { opacity: 1; transform: scale(1.2) rotate(180deg); }
+            }
+            
+            .god-emoji {
+                animation: fadeIn 2s ease-out, float 4s ease-in-out infinite;
+                font-size: 120px;
+                text-align: center;
+                filter: drop-shadow(0 0 20px rgba(255, 255, 255, 0.4));
+                display: inline-block;
+            }
+            
+            .god-name {
+                animation: fadeIn 2s ease-out 0.5s both, glow 3s ease-in-out infinite;
+                font-size: 32px;
+                color: #ffd700;
+                text-align: center;
+                margin-top: 20px;
+                font-weight: bold;
+                font-family: 'Yu Gothic', 'Meiryo', 'MS Gothic', sans-serif;
+                letter-spacing: 2px;
+            }
+            
+            .god-description {
+                animation: fadeIn 2s ease-out 1s both;
+                color: #ffffff;
+                margin-top: 15px;
+                font-size: 18px;
+                font-family: 'Yu Gothic', 'Meiryo', 'MS Gothic', sans-serif;
+                text-align: center;
+                padding: 0 20px;
+            }
+            
+            .sparkle {
+                position: absolute;
+                color: #ffd700;
+                font-size: 24px;
+                animation: sparkle 2s ease-in-out infinite;
+                pointer-events: none;
+            }
+        </style>
+        
+        <div style="position: relative; text-align: center; z-index: 1;">
+            <div class="god-emoji">""" + god_emoji + """</div>
+            <div class="god-name">""" + god_name + """</div>
+            <div class="god-description">""" + god_description + """</div>
+        </div>
+        
+        <div class="sparkle" style="top: 15%; left: 15%; animation-delay: 0s;">✨</div>
+        <div class="sparkle" style="top: 25%; right: 20%; animation-delay: 0.7s;">✨</div>
+        <div class="sparkle" style="bottom: 30%; left: 25%; animation-delay: 1.4s;">✨</div>
+        <div class="sparkle" style="bottom: 40%; right: 15%; animation-delay: 2.1s;">✨</div>
+        <div class="sparkle" style="top: 50%; left: 10%; animation-delay: 0.3s;">✨</div>
+        <div class="sparkle" style="top: 60%; right: 10%; animation-delay: 1.0s;">✨</div>
+    </div>
+    """
+    return character_html
+
+# -------------------------
 # Plotly 3D可視化
 # -------------------------
 def create_3d_network_plot(network: Dict, positions: np.ndarray, center_indices: List[int]) -> go.Figure:
@@ -691,6 +2103,177 @@ def main():
     
     # サイドバー
     st.sidebar.title("機能選択")
+    
+    # Excelファイルアップロード機能
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📊 設定ファイル")
+    
+    # アップロード方法を選択
+    upload_mode = st.sidebar.radio(
+        "アップロード方法",
+        ["5つのファイル（推奨）", "1つのファイル（3シート）", "4つの別ファイル"],
+        help="5つのExcelファイルをまとめて読み込むか、個別に読み込むかを選択"
+    )
+    
+    if upload_mode == "5つのファイル（推奨）":
+        st.sidebar.markdown("**5つのExcelファイルをアップロード:**")
+        
+        character_file = st.sidebar.file_uploader(
+            "1. 12神基本情報 (akiba12_character_list.xlsx)",
+            type=['xlsx', 'xls'],
+            key="char_file_all",
+            help="12神の基本情報（ID、名前、属性、絵文字、説明、格言）"
+        )
+        
+        maxim_file = st.sidebar.file_uploader(
+            "2. 格言ファイル (格言.xlsx)",
+            type=['xlsx', 'xls'],
+            key="maxim_file_all",
+            help="格言データ（オプション）"
+        )
+        
+        sense_to_vow_file = st.sidebar.file_uploader(
+            "3. sense_to_vow行列 (sense_to_vow_initial_filled_from_user.xlsx)",
+            type=['xlsx', 'xls'],
+            key="sense_to_vow_file_all",
+            help="感覚 × 誓願（8x12の行列）"
+        )
+        
+        k_matrix_file = st.sidebar.file_uploader(
+            "4. k行列 (akiba12_character_to_vow_K.xlsx)",
+            type=['xlsx', 'xls'],
+            key="k_matrix_file_all",
+            help="キャラクター × 誓願（12x12の行列）"
+        )
+        
+        l_matrix_file = st.sidebar.file_uploader(
+            "5. l行列 (akiba12_character_to_axis_L.xlsx)",
+            type=['xlsx', 'xls'],
+            key="l_matrix_file_all",
+            help="キャラクター × 世界観軸（12x4の行列）"
+        )
+        
+        if k_matrix_file is not None and l_matrix_file is not None:
+            if load_all_excel_files(
+                character_file=character_file,
+                maxim_file=maxim_file,
+                k_matrix_file=k_matrix_file,
+                l_matrix_file=l_matrix_file,
+                sense_to_vow_file=sense_to_vow_file
+            ):
+                st.sidebar.success("✅ 設定ファイルを読み込みました")
+                if LOADED_GODS:
+                    st.sidebar.info(f"読み込まれた神の数: {len(LOADED_GODS)}")
+                    with st.sidebar.expander("📋 読み込んだ設定の詳細"):
+                        st.write("**12神のリスト:**")
+                        for god in LOADED_GODS[:3]:
+                            st.write(f"- {god['emoji']} {god['name']}")
+                        if len(LOADED_GODS) > 3:
+                            st.write(f"... 他 {len(LOADED_GODS) - 3} 神")
+                        
+                        if SENSE_TO_VOW_MATRIX is not None:
+                            st.write(f"**sense_to_vow行列サイズ:** {SENSE_TO_VOW_MATRIX.shape}")
+                        if K_MATRIX is not None:
+                            st.write(f"**k行列サイズ:** {K_MATRIX.shape}")
+                        if L_MATRIX is not None:
+                            st.write(f"**l行列サイズ:** {L_MATRIX.shape}")
+            else:
+                st.sidebar.error("❌ 設定ファイルの読み込みに失敗しました")
+        elif k_matrix_file is not None or l_matrix_file is not None:
+            st.sidebar.warning("⚠️ k行列とl行列の両方が必要です")
+        else:
+            st.sidebar.info("💡 デフォルト設定を使用中")
+    
+    elif upload_mode == "1つのファイル（3シート）":
+        uploaded_file = st.sidebar.file_uploader(
+            "Excel設定ファイルをアップロード",
+            type=['xlsx', 'xls'],
+            help="12神の設定、k行列、l行列を含むExcelファイル（3つのシート）"
+        )
+        
+        if uploaded_file is not None:
+            if load_excel_config(excel_file=uploaded_file):
+                st.sidebar.success("✅ 設定ファイルを読み込みました")
+                if LOADED_GODS:
+                    st.sidebar.info(f"読み込まれた神の数: {len(LOADED_GODS)}")
+                    # 読み込んだ設定の詳細を表示（展開可能）
+                    with st.sidebar.expander("📋 読み込んだ設定の詳細"):
+                        st.write("**12神のリスト:**")
+                        for god in LOADED_GODS[:3]:  # 最初の3つだけ表示
+                            st.write(f"- {god['emoji']} {god['name']}")
+                        if len(LOADED_GODS) > 3:
+                            st.write(f"... 他 {len(LOADED_GODS) - 3} 神")
+                        
+                        if K_MATRIX is not None:
+                            st.write(f"**k行列サイズ:** {K_MATRIX.shape}")
+                        if L_MATRIX is not None:
+                            st.write(f"**l行列サイズ:** {L_MATRIX.shape}")
+            else:
+                st.sidebar.error("❌ 設定ファイルの読み込みに失敗しました")
+        else:
+            st.sidebar.info("💡 デフォルト設定を使用中")
+    
+    else:  # 4つの別ファイル
+        st.sidebar.markdown("**4つのファイルをアップロード:**")
+        
+        character_file = st.sidebar.file_uploader(
+            "1. 12神基本情報 (akiba12_character_list.xlsx)",
+            type=['xlsx', 'xls'],
+            key="character_file",
+            help="12神の基本情報（ID、名前、属性、絵文字、説明、格言）"
+        )
+        
+        sense_to_vow_file = st.sidebar.file_uploader(
+            "2. sense_to_vow行列 (sense_to_vow_initial_filled_from_user.xlsx)",
+            type=['xlsx', 'xls'],
+            key="sense_to_vow_file",
+            help="感覚 × 誓願（8x12の行列：迷い/焦り/静けさ/内省/行動/つながり/挑戦/待つ → 12誓願）"
+        )
+        
+        k_matrix_file = st.sidebar.file_uploader(
+            "3. k行列 (akiba12_character_to_vow_K.xlsx)",
+            type=['xlsx', 'xls'],
+            key="k_matrix_file",
+            help="キャラクター × 誓願（12x12の行列）"
+        )
+        
+        l_matrix_file = st.sidebar.file_uploader(
+            "4. l行列 (akiba12_character_to_axis_L.xlsx)",
+            type=['xlsx', 'xls'],
+            key="l_matrix_file",
+            help="キャラクター × 世界観軸（12x4の行列：静、流、間、誠）"
+        )
+        
+        if k_matrix_file is not None and l_matrix_file is not None:
+            if load_excel_config(
+                character_file=character_file,
+                sense_to_vow_file=sense_to_vow_file,
+                k_matrix_file=k_matrix_file,
+                l_matrix_file=l_matrix_file
+            ):
+                st.sidebar.success("✅ 設定ファイルを読み込みました")
+                if LOADED_GODS:
+                    st.sidebar.info(f"読み込まれた神の数: {len(LOADED_GODS)}")
+                    # 読み込んだ設定の詳細を表示（展開可能）
+                    with st.sidebar.expander("📋 読み込んだ設定の詳細"):
+                        st.write("**12神のリスト:**")
+                        for god in LOADED_GODS[:3]:  # 最初の3つだけ表示
+                            st.write(f"- {god['emoji']} {god['name']}")
+                        if len(LOADED_GODS) > 3:
+                            st.write(f"... 他 {len(LOADED_GODS) - 3} 神")
+                        
+                        if K_MATRIX is not None:
+                            st.write(f"**k行列サイズ:** {K_MATRIX.shape}")
+                        if L_MATRIX is not None:
+                            st.write(f"**l行列サイズ:** {L_MATRIX.shape}")
+            else:
+                st.sidebar.error("❌ 設定ファイルの読み込みに失敗しました")
+        elif k_matrix_file is not None or l_matrix_file is not None:
+            st.sidebar.warning("⚠️ k行列とl行列の両方が必要です")
+        else:
+            st.sidebar.info("💡 デフォルト設定を使用中")
+    
+    st.sidebar.markdown("---")
     app_mode = st.sidebar.selectbox(
         "実行モードを選択",
         ["基本デモ", "対話型量子神託", "言葉のエネルギー球体視覚化", "絵馬納め"]
@@ -733,10 +2316,17 @@ def main():
             # おみくじ（基本デモではmoodなし）
             oracle_pool = sols[:6]
             e_pick, x_pick = boltzmann_sample(oracle_pool, T=0.45)
-            card = oracle_card(e_pick, x_pick, mood=None)
+            card = oracle_card(e_pick, x_pick, mood=None, use_hierarchical=False, context_text="")
             
             st.markdown("---")
             st.subheader("量子おみくじ（Quantum Oracle）")
+            
+            # 選ばれた神のキャラクターを表示
+            if 'god' in card and card['god']:
+                selected_god = card['god']
+                character_html = render_god_character(selected_god)
+                st.components.v1.html(character_html, height=400)
+            
             st.write(f"**エネルギー**: {card['energy']:.3f}")
             
             # 選ばれた格言と引用元を表示
@@ -768,7 +2358,28 @@ def main():
             else:
                 m = infer_mood(user_text)
                 Q_today = build_qubo_from_mood(m)
-                sols = solve_all(Q_today)
+                
+                # Optunaを使った最適化（進捗表示付き）
+                optuna_container = st.empty()
+                sols, study = solve_all_with_optuna(Q_today, use_hierarchical=True, 
+                                                     progress_container=optuna_container, n_trials=50)
+                
+                # Optunaの可視化
+                if study is not None and OPTUNA_AVAILABLE:
+                    with st.expander("📊 QUBO最適化の詳細", expanded=False):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            try:
+                                fig_history = plot_optimization_history(study)
+                                st.plotly_chart(fig_history, use_container_width=True)
+                            except:
+                                st.write("最適化履歴の可視化に失敗しました")
+                        with col2:
+                            try:
+                                fig_importance = plot_param_importances(study)
+                                st.plotly_chart(fig_importance, use_container_width=True)
+                            except:
+                                st.write("パラメータ重要度の可視化に失敗しました")
                 
                 # 心の傾きを表示
                 col1, col2, col3, col4, col5 = st.columns(5)
@@ -786,7 +2397,8 @@ def main():
                 # 候補Top3
                 st.subheader("低エネルギー候補（選ばれた格言の重ね合わせ）Top3")
                 for rank, (e, x) in enumerate(sols[:3], start=1):
-                    picks = picks_from_x(x)
+                    god_for_candidate = get_selected_god_from_x(x, m, use_hierarchical=True)
+                    picks = select_maxims_for_god(god_for_candidate, context_text=user_text, top_k=2, include_famous_quote=False)
                     st.write(f"**{rank}. E={e:.3f}**")
                     for pick in picks:
                         source_info = get_maxim_source(pick)
@@ -797,28 +2409,57 @@ def main():
                 pool = sols[:6]
                 T = temperature_from_mood(m)
                 e_pick, x_pick = boltzmann_sample(pool, T=T)
-                card = oracle_card(e_pick, x_pick, mood=m)  # Moodを渡す
+                
+                # デバッグ: 解ベクトルの内容を確認
+                if len(x_pick) >= 32:
+                    # キャラクター変数（20〜31）が選ばれているか確認
+                    c_start = 20
+                    selected_char_indices = [i for i in range(c_start, min(c_start + 12, len(x_pick))) if i < len(x_pick) and x_pick[i] == 1]
+                    if not selected_char_indices:
+                        # キャラクターが選ばれていない場合、Moodから選択
+                        st.warning("⚠️ キャラクター変数が選ばれていません。Moodから選択します。")
+                
+                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=user_text)  # Moodを渡す
                 
                 st.markdown("---")
                 st.subheader("量子おみくじ（Quantum Oracle）")
                 
+                # 選ばれた神のキャラクターを表示
+                if 'god' in card and card['god']:
+                    selected_god = card['god']
+                    character_html = render_god_character(selected_god)
+                    st.components.v1.html(character_html, height=400)
+                
                 # 選ばれた格言の引用元情報を収集
                 sources_text = []
-                for pick in card['picks']:
-                    source_info = get_maxim_source(pick)
-                    sources_text.append(f"- {pick}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                if card.get('picks') and len(card['picks']) > 0:
+                    for pick in card['picks']:
+                        source_info = get_maxim_source(pick)
+                        sources_text.append(f"- {pick}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                else:
+                    # 格言が空の場合、選ばれた神の格言を使用
+                    selected_god_from_card = card.get('god')
+                    if selected_god_from_card and selected_god_from_card.get("maxim"):
+                        maxim = selected_god_from_card["maxim"]
+                        source_info = get_maxim_source(maxim)
+                        sources_text.append(f"- {maxim}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                    elif selected_god_from_card and selected_god_from_card.get("description"):
+                        desc = selected_god_from_card["description"]
+                        sources_text.append(f"- {desc}\n  *出典: {selected_god_from_card.get('name', '神託')}*")
+                    else:
+                        sources_text.append("- 今この瞬間を大切に。すべては縁で繋がっている。\n  *出典: 伝統的な教え*")
                 
                 st.info(f"""
 **エネルギー**: {card['energy']:.3f}
 
 **選ばれた縁**:
-{chr(10).join(sources_text)}
+{chr(10).join(sources_text) if sources_text else "- 今この瞬間を大切に。すべては縁で繋がっている。"}
 
 **ことば**:
-「{card['poem']}」
+「{card.get('poem', '今この瞬間を大切に。すべては縁で繋がっている。')}」
 
 **次の一歩**:
-{card['hint']}
+{card.get('hint', '一歩ずつ進んでいきましょう。')}
 """)
                 st.caption(f"※揺らぎ(T)={T:.2f}（大きいほど偶然性が増えます）")
                 
@@ -949,176 +2590,84 @@ def main():
                 # 絵馬が納められる演出
                 st.success("✨ 絵馬が納められました...")
                 
-                # 待機演出
-                with st.spinner("秋葉三尺坊大権現が現れています..."):
-                    time.sleep(1.0)
-                
-                # キャラクターアニメーション（HTML/CSS/JavaScript）
-                character_html = """
-                <div id="character-container" style="
-                    position: relative;
-                    width: 100%;
-                    height: 450px;
-                    background: linear-gradient(180deg, #0a0a1a 0%, #1a1a2e 50%, #0a0a1a 100%);
-                    border-radius: 15px;
-                    overflow: hidden;
-                    margin: 20px 0;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    box-shadow: 0 0 30px rgba(255, 215, 0, 0.2);
-                ">
-                    <style>
-                        @keyframes fadeIn {
-                            from { opacity: 0; transform: translateY(30px) scale(0.9); }
-                            to { opacity: 1; transform: translateY(0) scale(1); }
-                        }
-                        
-                        @keyframes float {
-                            0%, 100% { transform: translateY(0px) rotate(0deg); }
-                            25% { transform: translateY(-15px) rotate(-2deg); }
-                            50% { transform: translateY(-25px) rotate(0deg); }
-                            75% { transform: translateY(-15px) rotate(2deg); }
-                        }
-                        
-                        @keyframes glow {
-                            0%, 100% { 
-                                text-shadow: 0 0 10px rgba(255, 215, 0, 0.5), 
-                                            0 0 20px rgba(255, 215, 0, 0.3),
-                                            0 0 30px rgba(255, 215, 0, 0.1); 
-                            }
-                            50% { 
-                                text-shadow: 0 0 20px rgba(255, 215, 0, 0.8), 
-                                            0 0 30px rgba(255, 215, 0, 0.5),
-                                            0 0 40px rgba(255, 215, 0, 0.3); 
-                            }
-                        }
-                        
-                        @keyframes sparkle {
-                            0%, 100% { opacity: 0; transform: scale(0) rotate(0deg); }
-                            50% { opacity: 1; transform: scale(1.2) rotate(180deg); }
-                        }
-                        
-                        @keyframes shimmer {
-                            0% { background-position: -1000px 0; }
-                            100% { background-position: 1000px 0; }
-                        }
-                        
-                        .character {
-                            animation: fadeIn 2s ease-out, float 4s ease-in-out infinite;
-                            font-size: 140px;
-                            text-align: center;
-                            color: #ffffff;
-                            filter: drop-shadow(0 0 20px rgba(255, 255, 255, 0.4));
-                            display: inline-block;
-                        }
-                        
-                        .title {
-                            animation: fadeIn 2s ease-out 0.5s both, glow 3s ease-in-out infinite;
-                            font-size: 28px;
-                            color: #ffd700;
-                            text-align: center;
-                            margin-top: 20px;
-                            font-weight: bold;
-                            font-family: 'Yu Gothic', 'Meiryo', 'MS Gothic', sans-serif;
-                            letter-spacing: 2px;
-                        }
-                        
-                        .message {
-                            animation: fadeIn 2s ease-out 1s both;
-                            color: #ffffff;
-                            margin-top: 15px;
-                            font-size: 18px;
-                            font-family: 'Yu Gothic', 'Meiryo', 'MS Gothic', sans-serif;
-                        }
-                        
-                        .sparkle {
-                            position: absolute;
-                            color: #ffd700;
-                            font-size: 24px;
-                            animation: sparkle 2s ease-in-out infinite;
-                            pointer-events: none;
-                        }
-                        
-                        .background-shimmer {
-                            position: absolute;
-                            top: 0;
-                            left: 0;
-                            width: 100%;
-                            height: 100%;
-                            background: linear-gradient(
-                                90deg,
-                                transparent 0%,
-                                rgba(255, 215, 0, 0.1) 50%,
-                                transparent 100%
-                            );
-                            background-size: 200% 100%;
-                            animation: shimmer 3s linear infinite;
-                            pointer-events: none;
-                        }
-                    </style>
-                    
-                    <div class="background-shimmer"></div>
-                    
-                    <div style="position: relative; text-align: center; z-index: 1;">
-                        <div class="character">🦊✨</div>
-                        <div class="title">秋葉三尺坊大権現</div>
-                        <div class="message">あなたの願いを聞き届けました</div>
-                    </div>
-                    
-                    <div class="sparkle" style="top: 15%; left: 15%; animation-delay: 0s;">✨</div>
-                    <div class="sparkle" style="top: 25%; right: 20%; animation-delay: 0.7s;">✨</div>
-                    <div class="sparkle" style="bottom: 30%; left: 25%; animation-delay: 1.4s;">✨</div>
-                    <div class="sparkle" style="bottom: 40%; right: 15%; animation-delay: 2.1s;">✨</div>
-                    <div class="sparkle" style="top: 50%; left: 10%; animation-delay: 0.3s;">✨</div>
-                    <div class="sparkle" style="top: 60%; right: 10%; animation-delay: 1.0s;">✨</div>
-                </div>
-                
-                <script>
-                    // 追加のインタラクティブ効果（オプション）
-                    setTimeout(function() {
-                        var container = document.getElementById('character-container');
-                        if (container) {
-                            container.style.transition = 'all 0.3s ease';
-                        }
-                    }, 100);
-                </script>
-                """
-                
-                st.components.v1.html(character_html, height=450)
-                
                 # 願いを分析して神託を生成
                 m = infer_mood(ema_text)
                 Q_today = build_qubo_from_mood(m)
-                sols = solve_all(Q_today)
+                
+                # Optunaを使った最適化（進捗表示付き）
+                optuna_container = st.empty()
+                sols, study = solve_all_with_optuna(Q_today, use_hierarchical=True, 
+                                                     progress_container=optuna_container, n_trials=50)
+                
+                # Optunaの可視化（オプション）
+                if study is not None and OPTUNA_AVAILABLE:
+                    with st.expander("📊 QUBO最適化の詳細", expanded=False):
+                        try:
+                            fig_history = plot_optimization_history(study)
+                            st.plotly_chart(fig_history, use_container_width=True)
+                        except:
+                            st.write("最適化履歴の可視化に失敗しました")
                 
                 # おみくじ（Moodに応じて変化）
                 pool = sols[:6]
                 T = temperature_from_mood(m)
                 e_pick, x_pick = boltzmann_sample(pool, T=T)
-                card = oracle_card(e_pick, x_pick, mood=m)
+                
+                # デバッグ: 解ベクトルの内容を確認
+                if len(x_pick) >= 32:
+                    # キャラクター変数（20〜31）が選ばれているか確認
+                    c_start = 20
+                    selected_char_indices = [i for i in range(c_start, min(c_start + 12, len(x_pick))) if i < len(x_pick) and x_pick[i] == 1]
+                    if not selected_char_indices:
+                        # キャラクターが選ばれていない場合、Moodから選択
+                        st.warning("⚠️ キャラクター変数が選ばれていません。Moodから選択します。")
+                
+                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=ema_text)
+                
+                # 選ばれた神を取得
+                selected_god = card['god'] if 'god' in card else select_god_from_mood(m)
+                
+                # 待機演出
+                with st.spinner(f"{selected_god['name']}が現れています..."):
+                    time.sleep(1.0)
+                
+                # 選ばれた神のキャラクターを表示
+                character_html = render_god_character(selected_god)
+                st.components.v1.html(character_html, height=400)
                 
                 st.markdown("---")
-                st.subheader("🔮 秋葉三尺坊大権現からの神託")
+                st.subheader(f"🔮 {selected_god['name']}からの神託")
                 
                 # 選ばれた格言の引用元情報を収集
                 sources_text = []
-                for pick in card['picks']:
-                    source_info = get_maxim_source(pick)
-                    sources_text.append(f"- {pick}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                if card.get('picks') and len(card['picks']) > 0:
+                    for pick in card['picks']:
+                        source_info = get_maxim_source(pick)
+                        sources_text.append(f"- {pick}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                else:
+                    # 格言が空の場合、選ばれた神の格言を使用
+                    if selected_god and selected_god.get("maxim"):
+                        maxim = selected_god["maxim"]
+                        source_info = get_maxim_source(maxim)
+                        sources_text.append(f"- {maxim}\n  *出典: {source_info['source']} - {source_info['origin']}*")
+                    elif selected_god and selected_god.get("description"):
+                        desc = selected_god["description"]
+                        sources_text.append(f"- {desc}\n  *出典: {selected_god.get('name', '神託')}*")
+                    else:
+                        sources_text.append("- 今この瞬間を大切に。すべては縁で繋がっている。\n  *出典: 伝統的な教え*")
                 
                 # 神託カードを美しく表示
                 st.info(f"""
 **エネルギー**: {card['energy']:.3f}
 
 **選ばれた縁**:
-{chr(10).join(sources_text)}
+{chr(10).join(sources_text) if sources_text else "- 今この瞬間を大切に。すべては縁で繋がっている。"}
 
 **ことば**:
-「{card['poem']}」
+「{card.get('poem', '今この瞬間を大切に。すべては縁で繋がっている。')}」
 
 **次の一歩**:
-{card['hint']}
+{card.get('hint', '一歩ずつ進んでいきましょう。')}
 """)
                 
                 st.caption(f"※揺らぎ(T)={T:.2f}（大きいほど偶然性が増えます）")
