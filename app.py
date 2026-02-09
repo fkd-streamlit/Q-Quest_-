@@ -2077,23 +2077,24 @@ def select_maxims_for_god(
                 elif any(kw_lower in tag_lower for tag_lower in tags_lower):
                     s += 8.0  # タグ部分一致も高スコア
                     matched_keywords += 1
-                # テキスト完全一致
+                # テキスト完全一致（最優先）
                 elif kw_lower in text_lower:
-                    s += 3.0  # テキスト内のキーワード一致も高スコア
+                    s += 15.0  # テキスト内のキーワード完全一致は最高スコア
                     matched_keywords += 1
-                # テキスト部分一致（より柔軟なマッチング：日本語対応）
-                # 日本語の場合は単語分割が難しいため、文字列全体で部分一致をチェック
-                elif kw_lower in text_lower:
-                    s += 1.5  # 部分一致もスコアに加算
+                # テキスト部分一致（日本語対応：2文字以上の部分一致）
+                elif len(kw) >= 2 and kw[:2] in text_lower:
+                    s += 8.0  # 部分一致も高スコア
                     matched_keywords += 1
                 # さらに柔軟なマッチング：キーワードの文字が含まれているか
                 elif any(c in text_lower for c in kw_lower if len(c) >= 1):
-                    s += 0.8  # 文字レベルでの一致も考慮
+                    s += 3.0  # 文字レベルでの一致も考慮（スコアを上げる）
                     matched_keywords += 1
             
-            # キーワードが複数一致する場合、ボーナス
+            # キーワードが複数一致する場合、大幅なボーナス（重要）
             if matched_keywords >= 2:
-                s += 2.0 * matched_keywords  # 複数キーワード一致のボーナス（一致数に応じて増加）
+                s += 10.0 * matched_keywords  # 複数キーワード一致は大幅なボーナス
+            elif matched_keywords == 1:
+                s += 5.0  # 単一キーワード一致でもボーナス
         
         # QUBOで選ばれた誓願（VOW）に基づくスコアリング（キーワードがない場合の補助）
         if selected_vow_index is not None:
@@ -2140,21 +2141,34 @@ def select_maxims_for_god(
     # 全部スコアが低い（=キーワードに引っかからない）なら、ランダムに複数提示
     # ただし、キーワードがある場合は、スコアが低くてもキーワードに基づいて選択
     if scored:
-        if keywords and scored[0][0] < 1.0:
+        if keywords and scored[0][0] < 5.0:  # スコアが低い場合（5.0未満）
             # キーワードがあるがスコアが低い場合、キーワードに基づいて再スコアリング
             # 部分一致や類似語も考慮して、より柔軟にマッチング
             rescored = []
             for s, t in scored:
                 text_lower = t.lower()
                 new_score = s
+                matched_kw_count = 0
                 # キーワードの部分一致をチェック（日本語対応）
                 for kw in keywords:
                     kw_lower = kw.lower()
+                    # 完全一致
                     if kw_lower in text_lower:
-                        new_score += 2.0  # 部分一致でもスコアを上げる（重要）
-                    # キーワードの文字が含まれている場合も考慮
+                        new_score += 10.0  # 完全一致は大幅なスコアアップ
+                        matched_kw_count += 1
+                    # 部分一致（2文字以上）
+                    elif len(kw) >= 2 and kw[:2] in text_lower:
+                        new_score += 5.0  # 部分一致も高スコア
+                        matched_kw_count += 1
+                    # 文字レベルでの一致
                     elif any(c in text_lower for c in kw_lower if len(c) >= 1):
-                        new_score += 1.0  # 文字レベルでの一致も考慮
+                        new_score += 2.0  # 文字レベルでの一致も考慮
+                        matched_kw_count += 1
+                
+                # 複数キーワード一致のボーナス
+                if matched_kw_count >= 2:
+                    new_score += matched_kw_count * 5.0
+                
                 rescored.append((new_score, t))
             rescored.sort(key=lambda t: t[0], reverse=True)
             scored = rescored
@@ -2311,28 +2325,45 @@ def oracle_card(
     # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
     # QUBOで選ばれた誓願（VOW）の情報を使用
     if use_hierarchical:
-        # ユーザー入力がある場合、より多くの候補から選択（キーワードに基づいて絞り込む）
-        top_k_for_selection = 5 if context_text else 2
-        picks = select_maxims_for_god(
-            selected_god, 
-            context_text=context_text,  # ユーザー入力を使用
-            top_k=top_k_for_selection, 
-            include_famous_quote=True,
-            exclude_maxims=exclude_maxims,
-            selected_vow_index=selected_vow_index
-        )
+        picks = []
         
-        # 格言データベースからも追加で選択（ユーザー入力がある場合、キーワードに基づいて選択）
-        if MAXIMS_DATABASE and context_text:
-            keywords = extract_keywords_safe(context_text, top_n=8)
+        # ユーザー入力がある場合、キーワードに基づいて優先的に格言を選択
+        if context_text and MAXIMS_DATABASE:
+            # キーワード抽出（より多くのキーワードを抽出）
+            keywords = extract_keywords_safe(context_text, top_n=10)
+            
             if keywords:
-                db_maxims = select_maxims_from_database(keywords, top_k=4, exclude_maxims=exclude_maxims)
+                # キーワードに基づいて格言データベースから優先的に選択
+                db_maxims = select_maxims_from_database(keywords, top_k=8, exclude_maxims=exclude_maxims)
                 for db_maxim in db_maxims:
                     maxim_text = db_maxim.get("text", "")
                     if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
                         picks.append(maxim_text)
-                        if len(picks) >= 6:  # より多くの候補から選択
+                        if len(picks) >= 5:  # キーワードに基づく格言を優先
                             break
+                
+                # キーワードに基づいて格言を生成（既存の格言がない場合）
+                if len(picks) < 3:
+                    generated_maxim = generate_maxim_from_keywords(keywords, context_text)
+                    if generated_maxim and generated_maxim not in picks and generated_maxim not in exclude_maxims:
+                        picks.insert(0, generated_maxim)  # 生成された格言を最初に追加
+        
+        # キーワードに基づく格言がない場合、神の格言から選択
+        if len(picks) < 2:
+            top_k_for_selection = 3 if context_text else 2
+            god_picks = select_maxims_for_god(
+                selected_god, 
+                context_text=context_text,  # ユーザー入力を使用
+                top_k=top_k_for_selection, 
+                include_famous_quote=True,
+                exclude_maxims=exclude_maxims,
+                selected_vow_index=selected_vow_index
+            )
+            for pick in god_picks:
+                if pick and pick not in picks and pick not in exclude_maxims:
+                    picks.append(pick)
+                    if len(picks) >= 5:
+                        break
         
         # QUBOで選ばれた誓願（VOW）のベクトルに基づいてオリジナルな格言を生成
         if selected_vow_index is not None:
@@ -2622,18 +2653,24 @@ def select_maxims_from_database(
         # テキスト内のキーワード一致（日本語対応：部分一致も考慮）
         matched_count = 0
         for kw in keyword_set:
-            # 完全一致
+            # 完全一致（最優先）
             if kw in maxim_text_lower:
-                score += 2.0  # テキスト内のキーワード一致は高スコア
+                score += 10.0  # テキスト内のキーワード完全一致は最高スコア
                 matched_count += 1
             # 部分一致（日本語の場合、単語の境界が明確でないため）
+            elif len(kw) >= 2 and kw[:2] in maxim_text_lower:
+                score += 5.0  # 部分一致も高スコア
+                matched_count += 1
+            # 文字レベルでの一致
             elif any(c in maxim_text_lower for c in kw if len(c) >= 1):
-                score += 1.0  # 部分一致もスコアに加算
+                score += 2.0  # 文字レベルでの一致も考慮
                 matched_count += 1
         
-        # 複数キーワード一致のボーナス
+        # 複数キーワード一致のボーナス（重要）
         if matched_count >= 2:
-            score += matched_count * 1.5
+            score += matched_count * 5.0  # 複数キーワード一致は大幅なボーナス
+        elif matched_count == 1:
+            score += 3.0  # 単一キーワード一致でもボーナス
         
         if score > 0:
             scored_maxims.append((score, maxim))
@@ -2655,6 +2692,86 @@ def select_maxims_from_database(
         return selected
     
     return []
+
+def generate_maxim_from_keywords(keywords: List[str], context_text: str) -> Optional[str]:
+    """キーワードに基づいて格言を生成
+    
+    Args:
+        keywords: キーワードリスト
+        context_text: ユーザー入力テキスト
+    
+    Returns:
+        生成された格言（文字列）、生成できない場合はNone
+    """
+    if not keywords or not context_text:
+        return None
+    
+    # キーワードから意味を推測して格言を生成
+    # 例：「疲れ」「決断」→「疲れていても、決断する勇気を持て。一歩ずつ進めば道は開ける。」
+    
+    # キーワードの意味に基づくテンプレート
+    maxim_templates = {
+        "疲": ["疲れていても、一歩ずつ進めば道は開ける。", "疲れは休息の合図。無理をせず、今を大切に。", "疲れた時こそ、自分を労わる時。休息も成長の一部。"],
+        "決断": ["決断は勇気。迷う時間も、選択の一部。", "決断できない時は、時間をかけて考えてもよい。", "決断は一瞬、その結果は一生。慎重に、しかし恐れずに。"],
+        "不安": ["不安は未来への準備。今できることを大切に。", "不安は成長の証。一歩ずつ進めば、道は見えてくる。", "不安があっても、前に進む勇気を持て。"],
+        "迷": ["迷うことは、真剣に考えている証。時間をかけて答えを見つけよう。", "迷いは選択の余地がある証。焦らず、自分を信じて。", "迷う時は、心に問いかけてみよう。答えは必ず見つかる。"],
+        "孤独": ["孤独は自分と向き合う時間。大切な気づきが生まれる。", "一人の時間も、成長の糧。自分を大切に。", "孤独は一時的なもの。必ずつながりは見つかる。"],
+        "挑戦": ["挑戦は成長の種。失敗を恐れず、一歩を踏み出そう。", "挑戦する勇気が、新しい道を開く。", "挑戦は自分を変える力。恐れずに進もう。"],
+    }
+    
+    # キーワードに基づいてテンプレートを選択
+    selected_template = None
+    for kw in keywords:
+        kw_lower = kw.lower()
+        for key, templates in maxim_templates.items():
+            if key in kw_lower or kw_lower in key:
+                import random
+                selected_template = random.choice(templates)
+                break
+        if selected_template:
+            break
+    
+    # テンプレートがない場合、キーワードから直接生成
+    if not selected_template:
+        # キーワードを組み合わせて格言を生成
+        if len(keywords) >= 2:
+            # 例：「疲れ」「決断」→「疲れていても、決断する勇気を持て。」
+            key_phrases = {
+                "疲": "疲れていても",
+                "決断": "決断する勇気を持て",
+                "不安": "不安があっても",
+                "迷": "迷う時は",
+                "孤独": "一人でも",
+                "挑戦": "挑戦する勇気が",
+            }
+            
+            phrases = []
+            for kw in keywords[:3]:  # 最大3つのキーワードを使用
+                kw_lower = kw.lower()
+                for key, phrase in key_phrases.items():
+                    if key in kw_lower or kw_lower in key:
+                        phrases.append(phrase)
+                        break
+            
+            if phrases:
+                if len(phrases) >= 2:
+                    selected_template = f"{phrases[0]}、{phrases[1]}。一歩ずつ進めば道は開ける。"
+                else:
+                    selected_template = f"{phrases[0]}。今を大切に、一歩ずつ進もう。"
+    
+    # それでも生成できない場合、汎用的な格言を生成
+    if not selected_template:
+        if "疲" in context_text or "だる" in context_text:
+            selected_template = "疲れていても、一歩ずつ進めば道は開ける。休息も大切な選択。"
+        elif "決断" in context_text or "決め" in context_text:
+            selected_template = "決断は勇気。迷う時間も、選択の一部。焦らず、自分を信じて。"
+        elif "不安" in context_text or "心配" in context_text:
+            selected_template = "不安は未来への準備。今できることを大切に、一歩ずつ進もう。"
+        else:
+            # 汎用的な格言
+            selected_template = f"{keywords[0] if keywords else '今'}を大切に。一歩ずつ進めば道は開ける。"
+    
+    return selected_template
 
 def create_original_maxim_from_vow(
     selected_vow_index: Optional[int],
@@ -2784,23 +2901,41 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
                 found_keywords.append(word)
     
     # 3. 日本語の形態素解析的なアプローチ：文字列から意味のある単語を抽出
-    # 「疲れていて決断が出来ない」→「疲れ」「決断」を抽出
-    # 動詞の語幹や名詞を抽出する簡易版
+    # 「世界平和に貢献できる人間になる」→「世界平和」「貢献」「人間」を抽出
     import re
-    # ひらがな・カタカナ・漢字の連続を抽出
-    japanese_words = re.findall(r'[ひらがなカタカナ一-龠]+', text_original)
+    # まず、GLOBAL_WORDS_DATABASEに含まれる長い単語から抽出（優先）
+    # 長い単語から順にチェック（「世界平和」が「世界」や「平和」より優先される）
+    text_for_extraction = text_original  # 抽出用のテキスト（元のテキストは保持）
+    for word in sorted(GLOBAL_WORDS_DATABASE, key=len, reverse=True):
+        if word in text_for_extraction and word not in found_keywords:
+            found_keywords.append(word)
+            # 抽出した単語をテキストから削除（重複抽出を避ける）
+            text_for_extraction = text_for_extraction.replace(word, " ", 1)
+    
+    # ひらがな・カタカナ・漢字の連続を抽出（2文字以上）
+    japanese_words = re.findall(r'[ひらがなカタカナ一-龠]{2,}', text_for_extraction)
+    
+    # 助詞・助動詞のリスト（より包括的）
+    stop_words = [
+        'こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
+        'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか',
+        'ていて', 'が', 'を', 'に', 'で', 'と', 'から', 'まで', 'より', 'ので',
+        '出来ない', 'できない', '出来る', 'できる', 'である', 'です', 'ます',
+        'なる', 'する', 'れる', 'られる', 'させる', 'させられる', 'て', 'で', 'た', 'だ',
+        'れる', 'られる', 'せる', 'させる', 'ない', 'ぬ', 'ん', 'う', 'よう', 'まい'
+    ]
+    
     for word in japanese_words:
         if len(word) >= 2 and word not in found_keywords:
-            # 助詞や助動詞を除外
-            stop_words = ['こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
-                         'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか',
-                         'ていて', 'が', 'を', 'に', 'で', 'と', 'から', 'まで', 'より', 'ので',
-                         '出来ない', 'できない', '出来る', 'できる', 'である', 'です', 'ます']
-            if word not in stop_words and not any(sw in word for sw in stop_words):
-                # 既存のキーワードの一部でないかチェック
-                is_substring = any(word in kw or kw in word for kw in found_keywords if len(kw) > len(word))
+            # 助詞や助動詞を除外（完全一致と部分一致の両方をチェック）
+            is_stop_word = word in stop_words or any(sw in word for sw in stop_words if len(sw) >= 2)
+            if not is_stop_word:
+                # 既存のキーワードの一部でないかチェック（長いキーワードを優先）
+                is_substring = any(word in kw for kw in found_keywords if len(kw) > len(word))
                 if not is_substring:
-                    found_keywords.append(word)
+                    # 短すぎる単語（1-2文字）は除外（ただし、GLOBAL_WORDS_DATABASEに含まれる場合はOK）
+                    if len(word) >= 3 or word in GLOBAL_WORDS_DATABASE:
+                        found_keywords.append(word)
     
     # 4. テキストを単語に分割して、2文字以上の単語を抽出（英語やスペース区切りの場合）
     text_clean = re.sub(r'[0-9０-９\W]+', ' ', text_original)
@@ -2811,13 +2946,22 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
                            'でも', 'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか']:
                 found_keywords.append(word)
     
-    # 5. 重複を除去し、上位N個を返す（KEYWORDS辞書からの抽出を優先）
+    # 5. 重複を除去し、上位N個を返す（優先順位：GLOBAL_WORDS_DATABASE > KEYWORDS辞書 > その他）
     unique_keywords = list(dict.fromkeys(found_keywords))  # 順序を保持しながら重複除去
     
-    # KEYWORDS辞書からの抽出を優先的に並べる
-    keywords_from_dict = [kw for kw in unique_keywords if any(kw in kws or any(k in kw for k in kws) for kws in KEYWORDS.values() for k in kws)]
-    other_keywords = [kw for kw in unique_keywords if kw not in keywords_from_dict]
-    sorted_keywords = keywords_from_dict + other_keywords
+    # 優先順位でソート：
+    # 1. GLOBAL_WORDS_DATABASEに含まれるキーワード（長い順）
+    # 2. KEYWORDS辞書からの抽出
+    # 3. その他のキーワード（長い順）
+    keywords_from_global = [kw for kw in unique_keywords if kw in GLOBAL_WORDS_DATABASE]
+    keywords_from_global.sort(key=lambda x: (GLOBAL_WORDS_DATABASE.index(x) if x in GLOBAL_WORDS_DATABASE else 999, -len(x)))
+    
+    keywords_from_dict = [kw for kw in unique_keywords if kw not in keywords_from_global and any(kw in kws or any(k in kw for k in kws) for kws in KEYWORDS.values() for k in kws)]
+    
+    other_keywords = [kw for kw in unique_keywords if kw not in keywords_from_global and kw not in keywords_from_dict]
+    other_keywords.sort(key=lambda x: -len(x))  # 長い順
+    
+    sorted_keywords = keywords_from_global + keywords_from_dict + other_keywords
     
     return sorted_keywords[:top_n]
 
@@ -4062,9 +4206,8 @@ def main():
                 # 選ばれた神を取得
                 selected_god = card['god'] if 'god' in card else select_god_from_mood(m)
                 
-                # 待機演出
-                with st.spinner(f"{selected_god['name']}が現れています..."):
-                    time.sleep(1.0)
+                # 待機演出（Streamlitではtime.sleep()は非推奨のため、spinnerのみ使用）
+                # time.sleep()は削除（Streamlitの非同期処理と競合するため）
                 
                 # 選ばれた神のキャラクターを表示
                 character_html = render_god_character(selected_god, LOADED_GODS)
