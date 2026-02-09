@@ -329,7 +329,7 @@ GLOBAL_WORDS_DATABASE = [
     # 哲学・概念
     "調和", "バランス", "自然", "美", "真実", "自由", "正義", "道",
     # 関係性
-    "絆", "つながり", "家族", "友人", "仲間", "信頼", "尊敬", "協力",
+    "絆", "つながり", "家族", "友人", "仲間", "信頼", "尊敬", "協力", "夫婦", "生活", "円満",
     # 時間・流れ
     "今", "瞬間", "過程", "変化", "進化", "発展", "循環", "流れ",
     # 内的状態
@@ -2955,17 +2955,53 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
             # 抽出した単語をテキストから削除（重複抽出を避ける）
             text_for_extraction = text_for_extraction.replace(word, " ", 1)
     
-    # ひらがな・カタカナ・漢字の連続を抽出（2文字以上）
-    japanese_words = re.findall(r'[ひらがなカタカナ一-龠]{2,}', text_for_extraction)
+    # 助詞・助動詞で文章を分割してから、個別の単語を抽出
+    # 「夫婦生活が円満でありますように」→「夫婦生活」「円満」を抽出
+    import re
     
-    # 助詞・助動詞のリスト（より包括的）
+    # 助詞・助動詞のパターン（分割用：より包括的）
+    # 助詞：が、を、に、で、と、から、まで、より、ので、のに、でも、など、とか、だけ、ばかり、くらい、ほど、しか
+    # 助動詞：である、です、ます、れる、られる、せる、させる、ない、ぬ、ん、う、よう、まい
+    # その他：て、で、た、だ、あります、ように、であります
+    particle_pattern = r'[がをにでとからまでよりのでのにでもなどとかだけばかりくらいほどしかてでただであるですますれるられるせるさせるないぬんうようまいありますように]|であります|ありますように'
+    
+    # 助詞・助動詞で分割
+    # 例：「夫婦生活が円満でありますように」→「夫婦生活」「円満」に分割
+    split_text = re.split(particle_pattern, text_for_extraction)
+    
+    # 分割後の各単語を抽出
+    japanese_words = []
+    for segment in split_text:
+        segment = segment.strip()
+        if not segment:
+            continue
+        
+        # セグメント全体を単語として追加（複合語の場合：例「夫婦生活」）
+        # ただし、長すぎる場合は除外
+        if len(segment) >= 2 and len(segment) <= 8:
+            # 助詞・助動詞を含まない場合のみ追加
+            if not re.search(particle_pattern, segment):
+                if segment not in japanese_words:
+                    japanese_words.append(segment)
+        
+        # セグメントから個別の単語も抽出（例：「夫婦生活」→「夫婦」「生活」）
+        # 漢字・ひらがな・カタカナの連続を抽出（2文字以上、最大6文字まで）
+        words_in_segment = re.findall(r'[ひらがなカタカナ一-龠]{2,6}', segment)
+        for word in words_in_segment:
+            if len(word) >= 2 and len(word) <= 8 and word not in japanese_words:
+                # 助詞・助動詞を含まない場合のみ追加
+                if not re.search(particle_pattern, word):
+                    japanese_words.append(word)
+    
+    # 助詞・助動詞のリスト（除外用）
     stop_words = [
         'こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
         'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか',
         'ていて', 'が', 'を', 'に', 'で', 'と', 'から', 'まで', 'より', 'ので',
         '出来ない', 'できない', '出来る', 'できる', 'である', 'です', 'ます',
         'なる', 'する', 'れる', 'られる', 'させる', 'させられる', 'て', 'で', 'た', 'だ',
-        'れる', 'られる', 'せる', 'させる', 'ない', 'ぬ', 'ん', 'う', 'よう', 'まい'
+        'れる', 'られる', 'せる', 'させる', 'ない', 'ぬ', 'ん', 'う', 'よう', 'まい',
+        'あります', 'ように', 'であります', 'でありますように'
     ]
     
     for word in japanese_words:
@@ -2981,7 +3017,7 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
                 is_substring = any(word in kw for kw in found_keywords if len(kw) > len(word))
                 if not is_substring:
                     # 短すぎる単語（1-2文字）は除外（ただし、GLOBAL_WORDS_DATABASEに含まれる場合はOK）
-                    if len(word) >= 3 or word in GLOBAL_WORDS_DATABASE:
+                    if len(word) >= 2 or word in GLOBAL_WORDS_DATABASE:
                         found_keywords.append(word)
     
     # 4. テキストを単語に分割して、2文字以上の単語を抽出（英語やスペース区切りの場合）
