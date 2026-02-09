@@ -2014,45 +2014,70 @@ def select_maxims_for_god(
             default_text = desc or "今この瞬間を大切に。すべては縁で繋がっている。"
             if default_text not in exclude_set:
                 items = [{"text": default_text, "tags": []}]
+    
+    # キーワードがない場合、格言データベースからも追加で候補を取得（多様性を確保）
+    if not keywords and MAXIMS_DATABASE:
+        # ランダムにいくつかの格言を追加候補として取得
+        import time
+        random.seed(int(time.time() * 1000) % 1000000)
+        available_maxims = [m for m in MAXIMS_DATABASE if m.get("text") and m.get("text") not in exclude_set]
+        random.shuffle(available_maxims)
+        # 最大3つまで追加
+        for maxim in available_maxims[:3]:
+            maxim_text = maxim.get("text", "")
+            if maxim_text and maxim_text not in [it.get("text", "") for it in items]:
+                items.append({"text": maxim_text, "tags": maxim.get("tags", [])})
 
-    def score_item(item: Dict[str, object]) -> float:
+    def score_item(item: Dict[str, object], item_index: int) -> float:
         text = str(item.get("text", "") or "")
         tags = [str(t) for t in (item.get("tags") or [])]
         s = 0.0
         
-        # QUBOで選ばれた誓願（VOW）に基づくスコアリング（優先度を高く設定）
+        # キーワードベースのスコアリング（最優先：ユーザー入力の分析結果）
+        if keywords:
+            # タグ一致を最優先（ユーザー入力の分析結果を反映）
+            for kw in keywords:
+                if kw in tags:
+                    s += 10.0  # タグ一致は最高スコア（ユーザー入力の分析結果を最優先）
+                if kw and kw in text:
+                    s += 3.0  # テキスト内のキーワード一致も高スコア
+            # キーワードが複数一致する場合、ボーナス
+            matched_keywords = sum(1 for kw in keywords if kw in text or kw in tags)
+            if matched_keywords >= 2:
+                s += 2.0  # 複数キーワード一致のボーナス
+        
+        # QUBOで選ばれた誓願（VOW）に基づくスコアリング（キーワードがない場合の補助）
         if selected_vow_index is not None:
             # 選ばれた誓願に対応するVOW値が高い場合、その神の格言を優先
             vows = god.get("vows", {})
             vow_key = f"vow{selected_vow_index+1:02d}"
             if vow_key in vows:
                 vow_value = float(vows[vow_key])
-                # VOW値が負（強い関連性）の場合、スコアを大幅に上げる
+                # VOW値が負（強い関連性）の場合、スコアを上げる（キーワードがない場合の補助）
                 if vow_value < 0:
-                    s += abs(vow_value) * 5.0  # VOW値に基づく優先度（キーワードより優先）
+                    s += abs(vow_value) * 3.0  # VOW値に基づく優先度（キーワードがない場合の補助）
                 elif vow_value > 0:
-                    s += vow_value * 2.0  # 正の値でも少し優先
+                    s += vow_value * 1.0  # 正の値でも少し優先
         
-        # キーワードベースのスコアリング
-        if keywords:
-            # タグ一致を強めに
-            for kw in keywords:
-                if kw in tags:
-                    s += 3.0
-                if kw and kw in text:
-                    s += 1.0
-        else:
-            # キーワードがない場合でも、VOWベースのスコアがあれば使用
-            if s == 0.0:
-                s = 0.1  # 最小スコアを設定
+        # キーワードもVOWスコアもない場合
+        if s == 0.0:
+            # ランダム要素を追加して多様性を確保
+            import time
+            random.seed(int(time.time() * 1000) % 1000000 + item_index)
+            s = random.uniform(0.01, 0.5)  # ランダムなスコアを設定
         
         # 文章が短すぎる場合は少し減点
         if len(text) < 6:
             s -= 0.5
         return s
 
-    scored = [(score_item(it), it["text"]) for it in items if it.get("text")]
-    # スコアが同点ならランダムに揺らぐ
+    scored = [(score_item(it, idx), it["text"]) for idx, it in enumerate(items) if it.get("text")]
+    
+    # スコアが同点ならランダムに揺らぐ（各呼び出しで異なる結果を得るため）
+    import time
+    # 関数の呼び出しごとに異なるシードを使用（godのIDと時間を組み合わせ）
+    god_id = god.get("id", 0) if isinstance(god.get("id"), int) else hash(str(god.get("name", ""))) % 1000
+    random.seed(int(time.time() * 1000) % 1000000 + god_id * 100 + len(items))
     random.shuffle(scored)
     scored.sort(key=lambda t: t[0], reverse=True)
 
@@ -2063,9 +2088,11 @@ def select_maxims_for_god(
         if len(picks) >= max(1, top_k):
             break
 
-    # 全部スコア0（=キーワードに引っかからない）なら、ランダムに複数提示
-    if scored and scored[0][0] <= 0.0:
+    # 全部スコアが低い（=キーワードに引っかからない）なら、ランダムに複数提示
+    if scored and scored[0][0] < 1.0:  # スコアが1.0未満の場合
         all_texts = [t for _, t in scored if t and t not in exclude_set]
+        # 再度ランダムシードを設定して多様性を確保
+        random.seed(int(time.time() * 1000) % 1000000 + god_id * 200 + len(all_texts))
         random.shuffle(all_texts)
         picks = list(dict.fromkeys(all_texts))[:max(1, top_k)]
 
@@ -3327,20 +3354,33 @@ def main():
         # 基本デモでもキャラクター選択を反映
         st.info("💡 サイドバーでキャラクターや属性を選択すると、QUBOに反映されます")
         
+        # ユーザー入力を受け付ける（オプション）
+        user_input_basic = st.text_area(
+            "今日の悩み・気持ちを入力してください（オプション）",
+            placeholder="例：疲れていて決断ができない…",
+            height=100,
+            help="入力した文面を分析して、エネルギーが近い格言を選択します"
+        )
+        
         if st.button("実行"):
-            # キャラクター選択を反映したQUBOを生成
-            # デフォルトのMoodを使用（全て0.5）
-            default_mood = Mood(
-                fatigue=0.5,
-                anxiety=0.5,
-                curiosity=0.5,
-                loneliness=0.5,
-                decisiveness=0.5
-            )
+            # ユーザー入力からMoodを推定（入力がある場合）
+            if user_input_basic and user_input_basic.strip():
+                user_mood = infer_mood(user_input_basic.strip())
+                context_text_for_basic = user_input_basic.strip()
+            else:
+                # 入力がない場合、デフォルトのMoodを使用
+                user_mood = Mood(
+                    fatigue=0.5,
+                    anxiety=0.5,
+                    curiosity=0.5,
+                    loneliness=0.5,
+                    decisiveness=0.5
+                )
+                context_text_for_basic = ""
             
             # 選択されたキャラクター/属性を反映したQUBOを生成
             Q = build_qubo_from_mood(
-                default_mood,
+                user_mood,
                 selected_attribute=SELECTED_ATTRIBUTE,
                 selected_character=SELECTED_CHARACTER,
                 char_master=CHAR_MASTER
@@ -3351,16 +3391,25 @@ def main():
             
             # 結果表示
             st.subheader("低エネルギー上位（選ばれた格言の重なり）")
+            if context_text_for_basic:
+                st.caption(f"📝 入力文面: 「{context_text_for_basic}」")
+                # 抽出されたキーワードを表示
+                keywords_basic = extract_keywords_safe(context_text_for_basic, top_n=5)
+                if keywords_basic:
+                    st.caption(f"🔑 抽出されたキーワード: {', '.join(keywords_basic)}")
+            
             displayed_maxims_basic = []  # 既に表示した格言を記録（重複を避ける）
             for rank, (e, x) in enumerate(sols[:8], start=1):
                 # 階層構造の場合、キャラクターと格言を取得
                 if len(x) >= 32:
-                    selected_god = get_selected_god_from_x(x, default_mood, use_hierarchical=True)
+                    selected_god = get_selected_god_from_x(x, user_mood, use_hierarchical=True)
                     selected_vow_idx = get_selected_vow_from_x(x, use_hierarchical=True)
+                    
+                    # ユーザー入力文面を分析して、エネルギーが近い格言を選択
                     picks = select_maxims_for_god(
                         selected_god, 
-                        context_text="", 
-                        top_k=3,  # より多くの候補から選択
+                        context_text=context_text_for_basic,  # ユーザー入力を使用
+                        top_k=5,  # より多くの候補から選択
                         include_famous_quote=False,
                         selected_vow_index=selected_vow_idx,
                         exclude_maxims=displayed_maxims_basic  # 既に表示した格言を除外
@@ -3409,9 +3458,9 @@ def main():
             
             # おみくじ（基本デモでも階層構造を使用）
             oracle_pool = sols[:6]
-            T = temperature_from_mood(default_mood, SELECTED_CHARACTER)
+            T = temperature_from_mood(user_mood, SELECTED_CHARACTER)
             e_pick, x_pick = boltzmann_sample(oracle_pool, T=T)
-            card = oracle_card(e_pick, x_pick, mood=default_mood, use_hierarchical=True, context_text="")
+            card = oracle_card(e_pick, x_pick, mood=user_mood, use_hierarchical=True, context_text=context_text_for_basic)
             
             st.markdown("---")
             st.subheader("量子おみくじ（Quantum Oracle）")
