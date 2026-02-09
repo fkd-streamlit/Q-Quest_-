@@ -44,11 +44,22 @@
 ```
 Q-Quest_量子神託/
 ├── README.md                 # このファイル
+├── app.py                     # Streamlitアプリ（メイン）
 ├── Q_QUEST_量子神託.ipynb    # メインのJupyter Notebook
 ├── requirements.txt          # 依存パッケージ
 ├── setup_notebook.py         # Notebookコピー用スクリプト（オプション）
 ├── QUICK_START.md            # クイックスタートガイド
 ├── CONTRIBUTING.md           # 貢献ガイドライン
+├── assets/                   # 画像・リソースファイル
+│   └── images/
+│       └── characters/       # 12神のキャラクター画像（.png）
+│           ├── README.md     # 画像配置ガイド
+│           ├── character_01.png
+│           ├── character_02.png
+│           └── ... (character_12.png)
+├── config/                   # Excel設定ファイル（ローカル開発用）
+│   ├── README.md
+│   └── 設定ファイルの配置方法.md
 └── docs/                     # ドキュメント
     ├── README.md             # ドキュメント一覧と活用方法
     ├── PROJECT_VISION.md     # プロジェクトビジョン
@@ -145,6 +156,12 @@ jupyter notebook Q_QUEST_量子神託.ipynb
 - k行列（12x12：キャラクター × 誓願）とl行列（12x4：キャラクター × 世界観軸）をExcelから読み込み
 - 12神の設定をExcelでチューニング可能
 - 詳細は `EXCEL_SETUP_GUIDE.md` を参照
+
+**キャラクター画像の表示：**
+- 12神のキャラクター画像（.png）を `assets/images/characters/` フォルダーに配置
+- 画像ファイルの命名規則: `character_01.png` ～ `character_12.png`
+- Excelファイルの順序に合わせて画像を配置（1行目 → character_01.png）
+- 詳細は `CHARACTER_IMAGES_GUIDE.md` を参照
 
 ### Jupyter Notebook（`Q_QUEST_量子神託.ipynb`）
 
@@ -294,6 +311,7 @@ streamlit run app.py
 - **文化的背景**: `docs/CULTURAL_ELEMENTS.md`
 - **開発ロードマップ**: `docs/DEVELOPMENT_ROADMAP.md`
 - **貢献方法**: `CONTRIBUTING.md`
+- **キャラクター画像の配置**: `CHARACTER_IMAGES_GUIDE.md` ⭐NEW
 
 ## 技術的な詳細
 
@@ -321,4 +339,5 @@ streamlit run app.py
 ---
 
 **Q-Quest 量子神託** - Connecting People Through Quantum-Enhanced Destiny
+
 
