@@ -24,11 +24,25 @@ import json
 # Optuna for QUBO optimization visualization
 try:
     import optuna
-    from optuna.visualization import plot_optimization_history, plot_param_importances
+    from optuna.visualization import (
+        plot_optimization_history,
+        plot_param_importances,
+        plot_parallel_coordinate,
+        plot_contour,
+        plot_slice,
+        plot_timeline
+    )
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
     optuna = None
+    # 可視化関数もNoneに設定
+    plot_optimization_history = None
+    plot_param_importances = None
+    plot_parallel_coordinate = None
+    plot_contour = None
+    plot_slice = None
+    plot_timeline = None
 
 # -------------------------
 # 文字列ユーティリティ
@@ -2328,25 +2342,26 @@ def oracle_card(
         picks = []
         
         # ユーザー入力がある場合、キーワードに基づいて優先的に格言を選択
-        if context_text and MAXIMS_DATABASE:
+        if context_text:
             # キーワード抽出（より多くのキーワードを抽出）
-            keywords = extract_keywords_safe(context_text, top_n=10)
+            keywords = extract_keywords_safe(context_text, top_n=12)
             
+            # キーワードに基づいて格言を生成（最優先：ユーザー入力に直接応える）
             if keywords:
+                generated_maxim = generate_maxim_from_keywords(keywords, context_text)
+                if generated_maxim and generated_maxim not in picks and generated_maxim not in exclude_maxims:
+                    picks.insert(0, generated_maxim)  # 生成された格言を最初に追加
+            
+            # MAXIMS_DATABASEからキーワードに基づいて格言を選択
+            if MAXIMS_DATABASE and keywords:
                 # キーワードに基づいて格言データベースから優先的に選択
-                db_maxims = select_maxims_from_database(keywords, top_k=8, exclude_maxims=exclude_maxims)
+                db_maxims = select_maxims_from_database(keywords, top_k=10, exclude_maxims=exclude_maxims)
                 for db_maxim in db_maxims:
                     maxim_text = db_maxim.get("text", "")
                     if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
                         picks.append(maxim_text)
-                        if len(picks) >= 5:  # キーワードに基づく格言を優先
+                        if len(picks) >= 8:  # キーワードに基づく格言を優先（より多く選択）
                             break
-                
-                # キーワードに基づいて格言を生成（既存の格言がない場合）
-                if len(picks) < 3:
-                    generated_maxim = generate_maxim_from_keywords(keywords, context_text)
-                    if generated_maxim and generated_maxim not in picks and generated_maxim not in exclude_maxims:
-                        picks.insert(0, generated_maxim)  # 生成された格言を最初に追加
         
         # キーワードに基づく格言がない場合、神の格言から選択
         if len(picks) < 2:
@@ -2711,12 +2726,16 @@ def generate_maxim_from_keywords(keywords: List[str], context_text: str) -> Opti
     
     # キーワードの意味に基づくテンプレート
     maxim_templates = {
+        "健康": ["健康は最大の財産。日々の積み重ねが、未来の自分を創る。", "健康な体に、健康な心が宿る。自分を大切に、今日も一歩ずつ。", "健康は贈り物。感謝して、大切に守っていこう。"],
         "疲": ["疲れていても、一歩ずつ進めば道は開ける。", "疲れは休息の合図。無理をせず、今を大切に。", "疲れた時こそ、自分を労わる時。休息も成長の一部。"],
         "決断": ["決断は勇気。迷う時間も、選択の一部。", "決断できない時は、時間をかけて考えてもよい。", "決断は一瞬、その結果は一生。慎重に、しかし恐れずに。"],
         "不安": ["不安は未来への準備。今できることを大切に。", "不安は成長の証。一歩ずつ進めば、道は見えてくる。", "不安があっても、前に進む勇気を持て。"],
         "迷": ["迷うことは、真剣に考えている証。時間をかけて答えを見つけよう。", "迷いは選択の余地がある証。焦らず、自分を信じて。", "迷う時は、心に問いかけてみよう。答えは必ず見つかる。"],
         "孤独": ["孤独は自分と向き合う時間。大切な気づきが生まれる。", "一人の時間も、成長の糧。自分を大切に。", "孤独は一時的なもの。必ずつながりは見つかる。"],
         "挑戦": ["挑戦は成長の種。失敗を恐れず、一歩を踏み出そう。", "挑戦する勇気が、新しい道を開く。", "挑戦は自分を変える力。恐れずに進もう。"],
+        "仕事": ["仕事は人生の一部。バランスを保ちながら、一歩ずつ進もう。", "仕事を通じて、自分を成長させよう。", "仕事は貢献の形。誠実に、丁寧に取り組もう。"],
+        "家族": ["家族は絆。大切な人を思いやり、共に歩もう。", "家族の幸せは、自分の幸せ。共に笑い、共に支え合おう。", "家族は宝物。感謝の気持ちを忘れずに。"],
+        "幸せ": ["幸せは今この瞬間にある。小さな喜びを大切に。", "幸せは自分で創るもの。感謝の心を持って、一歩ずつ。", "幸せは分かち合うもの。周りの人と共に喜びを。"],
     }
     
     # キーワードに基づいてテンプレートを選択
@@ -2737,12 +2756,16 @@ def generate_maxim_from_keywords(keywords: List[str], context_text: str) -> Opti
         if len(keywords) >= 2:
             # 例：「疲れ」「決断」→「疲れていても、決断する勇気を持て。」
             key_phrases = {
+                "健康": "健康を大切に",
                 "疲": "疲れていても",
                 "決断": "決断する勇気を持て",
                 "不安": "不安があっても",
                 "迷": "迷う時は",
                 "孤独": "一人でも",
                 "挑戦": "挑戦する勇気が",
+                "仕事": "仕事に誠実に",
+                "家族": "家族を大切に",
+                "幸せ": "幸せを願って",
             }
             
             phrases = []
@@ -2761,15 +2784,26 @@ def generate_maxim_from_keywords(keywords: List[str], context_text: str) -> Opti
     
     # それでも生成できない場合、汎用的な格言を生成
     if not selected_template:
-        if "疲" in context_text or "だる" in context_text:
+        if "健康" in context_text or "体" in context_text or "身体" in context_text:
+            selected_template = "健康は最大の財産。日々の積み重ねが、未来の自分を創る。"
+        elif "疲" in context_text or "だる" in context_text:
             selected_template = "疲れていても、一歩ずつ進めば道は開ける。休息も大切な選択。"
         elif "決断" in context_text or "決め" in context_text:
             selected_template = "決断は勇気。迷う時間も、選択の一部。焦らず、自分を信じて。"
         elif "不安" in context_text or "心配" in context_text:
             selected_template = "不安は未来への準備。今できることを大切に、一歩ずつ進もう。"
+        elif "仕事" in context_text:
+            selected_template = "仕事は人生の一部。バランスを保ちながら、一歩ずつ進もう。"
+        elif "家族" in context_text:
+            selected_template = "家族は絆。大切な人を思いやり、共に歩もう。"
+        elif "幸せ" in context_text or "幸福" in context_text:
+            selected_template = "幸せは今この瞬間にある。小さな喜びを大切に。"
         else:
-            # 汎用的な格言
-            selected_template = f"{keywords[0] if keywords else '今'}を大切に。一歩ずつ進めば道は開ける。"
+            # 汎用的な格言（キーワードを使用）
+            if keywords:
+                selected_template = f"{keywords[0]}を大切に。一歩ずつ進めば道は開ける。"
+            else:
+                selected_template = "今を大切に。一歩ずつ進めば道は開ける。"
     
     return selected_template
 
@@ -3884,22 +3918,83 @@ def main():
                 sols, study = solve_all_with_optuna(Q_today, use_hierarchical=True, 
                                                      progress_container=optuna_container, n_trials=50)
                 
-                # Optunaの可視化
+                # Optunaの可視化（全ての可視化を表示）
                 if study is not None and OPTUNA_AVAILABLE:
                     with st.expander("📊 QUBO最適化の詳細", expanded=False):
-                        col1, col2 = st.columns(2)
-                        with col1:
+                        # タブで可視化を整理
+                        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                            "📈 最適化履歴", 
+                            "🎯 パラメータ重要度", 
+                            "🔄 パラレルコーディネート",
+                            "🗺️ 等高線",
+                            "📊 スライス",
+                            "⏱️ タイムライン"
+                        ])
+                        
+                        with tab1:
                             try:
                                 fig_history = plot_optimization_history(study)
                                 st.plotly_chart(fig_history, use_container_width=True)
-                            except:
-                                st.write("最適化履歴の可視化に失敗しました")
-                        with col2:
+                                st.caption("最適化の進行状況を表示します。")
+                            except Exception as e:
+                                st.write(f"最適化履歴の可視化に失敗しました: {str(e)}")
+                        
+                        with tab2:
                             try:
                                 fig_importance = plot_param_importances(study)
                                 st.plotly_chart(fig_importance, use_container_width=True)
-                            except:
-                                st.write("パラメータ重要度の可視化に失敗しました")
+                                st.caption("各パラメータの重要度を表示します。")
+                            except Exception as e:
+                                st.write(f"パラメータ重要度の可視化に失敗しました: {str(e)}")
+                        
+                        with tab3:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_parallel = plot_parallel_coordinate(study)
+                                    st.plotly_chart(fig_parallel, use_container_width=True)
+                                    st.caption("パラメータ間の関係を可視化します。")
+                                else:
+                                    st.info("パラレルコーディネートを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"パラレルコーディネートの可視化に失敗しました: {str(e)}")
+                        
+                        with tab4:
+                            try:
+                                if len(study.trials) > 0:
+                                    # 最初の2つのパラメータで等高線を表示
+                                    params = list(study.trials[0].params.keys()) if study.trials else []
+                                    if len(params) >= 2:
+                                        fig_contour = plot_contour(study, params=[params[0], params[1]])
+                                        st.plotly_chart(fig_contour, use_container_width=True)
+                                        st.caption(f"パラメータ「{params[0]}」と「{params[1]}」の関係を等高線で表示します。")
+                                    else:
+                                        st.info("等高線を表示するには、少なくとも2つのパラメータが必要です。")
+                                else:
+                                    st.info("等高線を表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"等高線の可視化に失敗しました: {str(e)}")
+                        
+                        with tab5:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_slice = plot_slice(study)
+                                    st.plotly_chart(fig_slice, use_container_width=True)
+                                    st.caption("各パラメータのスライスプロットを表示します。")
+                                else:
+                                    st.info("スライスプロットを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"スライスプロットの可視化に失敗しました: {str(e)}")
+                        
+                        with tab6:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_timeline = plot_timeline(study)
+                                    st.plotly_chart(fig_timeline, use_container_width=True)
+                                    st.caption("最適化のタイムラインを表示します。")
+                                else:
+                                    st.info("タイムラインを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"タイムラインの可視化に失敗しました: {str(e)}")
                 
                 # 心の傾きを表示
                 col1, col2, col3, col4, col5 = st.columns(5)
@@ -4156,6 +4251,25 @@ def main():
             help="あなたの願いや悩みを自由に書いてください"
         )
         
+        # LLM使用オプション
+        col1, col2 = st.columns(2)
+        with col1:
+            use_llm_ema = st.checkbox(
+                "🤖 LLMでパーソナライズされた神託を生成",
+                value=False,
+                help="LLMを使用して、よりパーソナライズされた神託を生成します（無償で使用可能）"
+            )
+        with col2:
+            if use_llm_ema:
+                llm_type_ema = st.selectbox(
+                    "LLMの種類",
+                    ["huggingface", "ollama"],
+                    index=0,
+                    help="Hugging Face（無償）またはOllama（ローカル）を選択"
+                )
+            else:
+                llm_type_ema = "huggingface"
+        
         if st.button("🎋 絵馬を納める", type="primary", use_container_width=True):
             if not ema_text.strip():
                 st.warning("願いを書いてから納めてください")
@@ -4178,14 +4292,83 @@ def main():
                 sols, study = solve_all_with_optuna(Q_today, use_hierarchical=True, 
                                                      progress_container=optuna_container, n_trials=50)
                 
-                # Optunaの可視化（オプション）
+                # Optunaの可視化（全ての可視化を表示）
                 if study is not None and OPTUNA_AVAILABLE:
                     with st.expander("📊 QUBO最適化の詳細", expanded=False):
-                        try:
-                            fig_history = plot_optimization_history(study)
-                            st.plotly_chart(fig_history, use_container_width=True)
-                        except:
-                            st.write("最適化履歴の可視化に失敗しました")
+                        # タブで可視化を整理
+                        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                            "📈 最適化履歴", 
+                            "🎯 パラメータ重要度", 
+                            "🔄 パラレルコーディネート",
+                            "🗺️ 等高線",
+                            "📊 スライス",
+                            "⏱️ タイムライン"
+                        ])
+                        
+                        with tab1:
+                            try:
+                                fig_history = plot_optimization_history(study)
+                                st.plotly_chart(fig_history, use_container_width=True)
+                                st.caption("最適化の進行状況を表示します。")
+                            except Exception as e:
+                                st.write(f"最適化履歴の可視化に失敗しました: {str(e)}")
+                        
+                        with tab2:
+                            try:
+                                fig_importance = plot_param_importances(study)
+                                st.plotly_chart(fig_importance, use_container_width=True)
+                                st.caption("各パラメータの重要度を表示します。")
+                            except Exception as e:
+                                st.write(f"パラメータ重要度の可視化に失敗しました: {str(e)}")
+                        
+                        with tab3:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_parallel = plot_parallel_coordinate(study)
+                                    st.plotly_chart(fig_parallel, use_container_width=True)
+                                    st.caption("パラメータ間の関係を可視化します。")
+                                else:
+                                    st.info("パラレルコーディネートを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"パラレルコーディネートの可視化に失敗しました: {str(e)}")
+                        
+                        with tab4:
+                            try:
+                                if len(study.trials) > 0:
+                                    # 最初の2つのパラメータで等高線を表示
+                                    params = list(study.trials[0].params.keys()) if study.trials else []
+                                    if len(params) >= 2:
+                                        fig_contour = plot_contour(study, params=[params[0], params[1]])
+                                        st.plotly_chart(fig_contour, use_container_width=True)
+                                        st.caption(f"パラメータ「{params[0]}」と「{params[1]}」の関係を等高線で表示します。")
+                                    else:
+                                        st.info("等高線を表示するには、少なくとも2つのパラメータが必要です。")
+                                else:
+                                    st.info("等高線を表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"等高線の可視化に失敗しました: {str(e)}")
+                        
+                        with tab5:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_slice = plot_slice(study)
+                                    st.plotly_chart(fig_slice, use_container_width=True)
+                                    st.caption("各パラメータのスライスプロットを表示します。")
+                                else:
+                                    st.info("スライスプロットを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"スライスプロットの可視化に失敗しました: {str(e)}")
+                        
+                        with tab6:
+                            try:
+                                if len(study.trials) > 0:
+                                    fig_timeline = plot_timeline(study)
+                                    st.plotly_chart(fig_timeline, use_container_width=True)
+                                    st.caption("最適化のタイムラインを表示します。")
+                                else:
+                                    st.info("タイムラインを表示するには、複数のトライアルが必要です。")
+                            except Exception as e:
+                                st.write(f"タイムラインの可視化に失敗しました: {str(e)}")
                 
                 # おみくじ（Moodに応じて変化）
                 pool = sols[:6]
@@ -4201,7 +4384,13 @@ def main():
                         # キャラクターが選ばれていない場合、Moodから選択
                         st.warning("⚠️ キャラクター変数が選ばれていません。Moodから選択します。")
                 
-                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=ema_text, use_llm=False, llm_type="huggingface")
+                # キーワード抽出の結果を表示（デバッグ用）
+                keywords_ema = extract_keywords_safe(ema_text, top_n=10)
+                if keywords_ema:
+                    with st.expander("🔑 抽出されたキーワード", expanded=False):
+                        st.write(f"**キーワード**: {', '.join(keywords_ema)}")
+                
+                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=ema_text, use_llm=use_llm_ema, llm_type=llm_type_ema)
                 
                 # 選ばれた神を取得
                 selected_god = card['god'] if 'god' in card else select_god_from_mood(m)
@@ -4233,6 +4422,15 @@ def main():
                         sources_text.append(f"- {desc}\n  *出典: {selected_god.get('name', '神託')}*")
                     else:
                         sources_text.append("- 今この瞬間を大切に。すべては縁で繋がっている。\n  *出典: 伝統的な教え*")
+                
+                # LLM生成の神託を「選ばれた縁」に統合
+                if card.get('llm_oracle') and use_llm_ema and card['llm_oracle'].strip():
+                    # LLM生成の神託を最初に追加
+                    llm_text = card['llm_oracle'].strip()
+                    sources_text.insert(0, f"🤖 {llm_text}\n  *出典: LLM生成 - パーソナライズされた神託*")
+                elif use_llm_ema:
+                    # LLM生成に失敗した場合、フォールバックメッセージを追加
+                    sources_text.insert(0, f"💭 LLM生成は現在利用できません。格言ベースの神託を表示しています。\n  *出典: 伝統的な教え*")
                 
                 # 神託カードを美しく表示
                 st.info(f"""
