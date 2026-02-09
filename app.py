@@ -1974,12 +1974,24 @@ def select_maxims_for_god(
     god: Dict,
     context_text: str,
     top_k: int = 2,
-    include_famous_quote: bool = True
+    include_famous_quote: bool = True,
+    exclude_maxims: Optional[List[str]] = None,
+    selected_vow_index: Optional[int] = None
 ) -> List[str]:
-    """ユーザー入力（context_text）に応じて、神（キャラクター）の複数格言を選ぶ"""
+    """ユーザー入力（context_text）とQUBOで選ばれた誓願（VOW）に応じて、神（キャラクター）の複数格言を選ぶ
+    
+    Args:
+        god: 神の情報
+        context_text: ユーザーの入力テキスト
+        top_k: 選択する格言の数
+        include_famous_quote: 有名名言を含めるか
+        exclude_maxims: 除外する格言のリスト（重複を避けるため）
+        selected_vow_index: QUBOで選ばれた誓願（VOW）のインデックス（0-11、VOW_01～VOW_12に対応）
+    """
     if not god:
         return ["今この瞬間を大切に。すべては縁で繋がっている。"]
 
+    exclude_set = set(exclude_maxims or [])
     ctx = (context_text or "").strip()
     keywords = extract_keywords_safe(ctx, top_n=6) if ctx else []
 
@@ -1988,28 +2000,52 @@ def select_maxims_for_god(
     items: List[Dict[str, object]] = []
     for it in maxims:
         if isinstance(it, dict) and it.get("text"):
-            items.append({"text": str(it["text"]).strip(), "tags": it.get("tags") or []})
+            text = str(it["text"]).strip()
+            # 除外リストに含まれていない場合のみ追加
+            if text and text not in exclude_set:
+                items.append({"text": text, "tags": it.get("tags") or []})
 
     if not items:
         base = (god.get("maxim") or "").strip()
-        if base:
+        if base and base not in exclude_set:
             items = [{"text": base, "tags": []}]
         else:
             desc = (god.get("description") or "").strip()
-            items = [{"text": desc or "今この瞬間を大切に。すべては縁で繋がっている。", "tags": []}]
+            default_text = desc or "今この瞬間を大切に。すべては縁で繋がっている。"
+            if default_text not in exclude_set:
+                items = [{"text": default_text, "tags": []}]
 
     def score_item(item: Dict[str, object]) -> float:
         text = str(item.get("text", "") or "")
         tags = [str(t) for t in (item.get("tags") or [])]
-        if not keywords:
-            return 0.0
         s = 0.0
-        # タグ一致を強めに
-        for kw in keywords:
-            if kw in tags:
-                s += 3.0
-            if kw and kw in text:
-                s += 1.0
+        
+        # QUBOで選ばれた誓願（VOW）に基づくスコアリング（優先度を高く設定）
+        if selected_vow_index is not None:
+            # 選ばれた誓願に対応するVOW値が高い場合、その神の格言を優先
+            vows = god.get("vows", {})
+            vow_key = f"vow{selected_vow_index+1:02d}"
+            if vow_key in vows:
+                vow_value = float(vows[vow_key])
+                # VOW値が負（強い関連性）の場合、スコアを大幅に上げる
+                if vow_value < 0:
+                    s += abs(vow_value) * 5.0  # VOW値に基づく優先度（キーワードより優先）
+                elif vow_value > 0:
+                    s += vow_value * 2.0  # 正の値でも少し優先
+        
+        # キーワードベースのスコアリング
+        if keywords:
+            # タグ一致を強めに
+            for kw in keywords:
+                if kw in tags:
+                    s += 3.0
+                if kw and kw in text:
+                    s += 1.0
+        else:
+            # キーワードがない場合でも、VOWベースのスコアがあれば使用
+            if s == 0.0:
+                s = 0.1  # 最小スコアを設定
+        
         # 文章が短すぎる場合は少し減点
         if len(text) < 6:
             s -= 0.5
@@ -2022,24 +2058,51 @@ def select_maxims_for_god(
 
     picks: List[str] = []
     for s, t in scored:
-        if t and t not in picks:
+        if t and t not in picks and t not in exclude_set:
             picks.append(t)
         if len(picks) >= max(1, top_k):
             break
 
     # 全部スコア0（=キーワードに引っかからない）なら、ランダムに複数提示
     if scored and scored[0][0] <= 0.0:
-        all_texts = [t for _, t in scored if t]
+        all_texts = [t for _, t in scored if t and t not in exclude_set]
         random.shuffle(all_texts)
         picks = list(dict.fromkeys(all_texts))[:max(1, top_k)]
 
     # 有名名言も1つ混ぜる（任意）
     if include_famous_quote and keywords:
-        famous = select_relevant_quote(keywords)
-        if famous and famous not in picks:
+        famous = select_relevant_quote(keywords, exclude_quotes=exclude_set)
+        if famous and famous not in picks and famous not in exclude_set:
             picks.append(famous)
 
     return picks if picks else ["今この瞬間を大切に。すべては縁で繋がっている。"]
+
+def get_selected_vow_from_x(x: np.ndarray, use_hierarchical: bool = False) -> Optional[int]:
+    """QUBOの解ベクトルから選ばれた誓願（VOW）のインデックスを取得
+    
+    Args:
+        x: 解ベクトル
+        use_hierarchical: 多層バイナリ構造を使用する場合True
+    
+    Returns:
+        選ばれた誓願のインデックス（0-11、VOW_01～VOW_12に対応）、選ばれていない場合はNone
+    """
+    if use_hierarchical:
+        # 多層バイナリ構造の場合
+        if len(x) < 32:
+            return None
+        
+        # 誓願変数のインデックス: 8～19
+        v_start = 8
+        selected_vow_ids = [i - v_start for i in range(v_start, min(v_start + 12, len(x))) if i < len(x) and x[i] == 1]
+        
+        if selected_vow_ids:
+            return selected_vow_ids[0]  # 最初に選ばれた誓願を返す
+    else:
+        # 従来の構造では誓願変数がない
+        return None
+    
+    return None
 
 def get_selected_god_from_x(x: np.ndarray, mood: Mood = None, use_hierarchical: bool = False) -> Dict:
     """選ばれた神を取得
@@ -2125,20 +2188,59 @@ def oracle_card(
     # 選ばれた神を取得（先に取得して、格言も取得）
     selected_god = get_selected_god_from_x(x, mood, use_hierarchical=use_hierarchical)
     
-    # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
+    # QUBOの解ベクトルから選ばれた誓願（VOW）を取得
+    selected_vow_index = None
     if use_hierarchical:
-        picks = select_maxims_for_god(selected_god, context_text=context_text, top_k=2, include_famous_quote=True)
+        selected_vow_index = get_selected_vow_from_x(x, use_hierarchical=use_hierarchical)
+    
+    # 最近使用した格言を取得（重複を避けるため）
+    if 'recent_maxims' not in st.session_state:
+        st.session_state.recent_maxims = []
+    exclude_maxims = st.session_state.recent_maxims[-10:]  # 直近10件を除外
+    
+    # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
+    # QUBOで選ばれた誓願（VOW）の情報を使用
+    if use_hierarchical:
+        picks = select_maxims_for_god(
+            selected_god, 
+            context_text=context_text, 
+            top_k=2, 
+            include_famous_quote=True,
+            exclude_maxims=exclude_maxims,
+            selected_vow_index=selected_vow_index
+        )
         
         # 格言データベースからも追加で選択
         if MAXIMS_DATABASE and context_text:
             keywords = extract_keywords_safe(context_text, top_n=5)
-            db_maxims = select_maxims_from_database(keywords, top_k=2)
+            db_maxims = select_maxims_from_database(keywords, top_k=2, exclude_maxims=exclude_maxims)
             for db_maxim in db_maxims:
                 maxim_text = db_maxim.get("text", "")
-                if maxim_text and maxim_text not in picks:
+                if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
                     picks.append(maxim_text)
                     if len(picks) >= 4:
                         break
+        
+        # QUBOで選ばれた誓願（VOW）のベクトルに基づいてオリジナルな格言を生成
+        if selected_vow_index is not None:
+            original_maxim = create_original_maxim_from_vow(
+                selected_vow_index=selected_vow_index,
+                god=selected_god,
+                top_k=3
+            )
+            if original_maxim and original_maxim not in picks and original_maxim not in exclude_maxims:
+                # オリジナルな格言を最初に追加（優先表示）
+                picks.insert(0, original_maxim)
+                if len(picks) > 4:
+                    picks = picks[:4]  # 最大4つまで
+    
+    # 選択した格言を履歴に追加（重複を避ける）
+    for pick in picks:
+        if pick and pick not in st.session_state.recent_maxims:
+            st.session_state.recent_maxims.append(pick)
+            # 履歴は最大20件に制限
+            if len(st.session_state.recent_maxims) > 20:
+                st.session_state.recent_maxims.pop(0)
     else:
         picks = picks_from_x(x, use_hierarchical=use_hierarchical, selected_god=selected_god)
     
@@ -2351,12 +2453,17 @@ def generate_with_huggingface(prompt: str, model: str = "microsoft/DialoGPT-medi
         # エラーが発生した場合、空文字を返す（フォールバック）
         return ""
 
-def select_maxims_from_database(keywords: List[str], top_k: int = 3) -> List[Dict]:
+def select_maxims_from_database(
+    keywords: List[str], 
+    top_k: int = 3,
+    exclude_maxims: Optional[List[str]] = None
+) -> List[Dict]:
     """格言データベースからキーワードに基づいて格言を選択
     
     Args:
         keywords: キーワードリスト
         top_k: 選択する格言の数
+        exclude_maxims: 除外する格言のリスト（重複を避けるため）
     
     Returns:
         選択された格言のリスト
@@ -2365,13 +2472,19 @@ def select_maxims_from_database(keywords: List[str], top_k: int = 3) -> List[Dic
     if not MAXIMS_DATABASE:
         return []
     
+    exclude_set = set(exclude_maxims or [])
     # キーワードに基づいてスコアリング
     scored_maxims = []
     keyword_set = set([kw.lower() for kw in keywords])
     
     for maxim in MAXIMS_DATABASE:
+        maxim_text = maxim.get("text", "")
+        # 除外リストに含まれている場合はスキップ
+        if maxim_text in exclude_set:
+            continue
+            
         score = 0.0
-        maxim_text = maxim.get("text", "").lower()
+        maxim_text_lower = maxim_text.lower()
         maxim_tags = [tag.lower() for tag in maxim.get("tags", [])]
         
         # タグ一致を優先
@@ -2381,7 +2494,7 @@ def select_maxims_from_database(keywords: List[str], top_k: int = 3) -> List[Dic
         
         # テキスト内のキーワード一致
         for kw in keyword_set:
-            if kw in maxim_text:
+            if kw in maxim_text_lower:
                 score += 1.0
         
         if score > 0:
@@ -2390,8 +2503,114 @@ def select_maxims_from_database(keywords: List[str], top_k: int = 3) -> List[Dic
     # スコアでソート
     scored_maxims.sort(key=lambda x: x[0], reverse=True)
     
-    # 上位k個を選択
-    return [maxim for _, maxim in scored_maxims[:top_k]]
+    # 上位k個を選択（ランダム要素を追加して多様性を確保）
+    if scored_maxims:
+        # 上位10個からランダムに選択
+        top_candidates = scored_maxims[:min(10, len(scored_maxims))]
+        random.shuffle(top_candidates)
+        selected = []
+        for _, maxim in top_candidates:
+            if len(selected) >= top_k:
+                break
+            if maxim.get("text") not in exclude_set:
+                selected.append(maxim)
+        return selected
+    
+    return []
+
+def create_original_maxim_from_vow(
+    selected_vow_index: Optional[int],
+    god: Dict,
+    top_k: int = 3
+) -> Optional[str]:
+    """選ばれた誓願（VOW）のベクトルに基づいて、格言データベースから部分的に組み合わせてオリジナルな格言を生成
+    
+    Args:
+        selected_vow_index: 選ばれた誓願（VOW）のインデックス（0-11、Noneの場合は生成しない）
+        god: 選ばれた神の情報
+        top_k: 組み合わせに使用する格言の数
+    
+    Returns:
+        生成されたオリジナルな格言（生成できない場合はNone）
+    """
+    global MAXIMS_DATABASE
+    if not MAXIMS_DATABASE or selected_vow_index is None:
+        return None
+    
+    # 選ばれた誓願に対応するVOW値を取得
+    vows = god.get("vows", {})
+    vow_key = f"vow{selected_vow_index+1:02d}"
+    selected_vow_value = vows.get(vow_key, 0.0) if vow_key in vows else 0.0
+    
+    # VOW値が非常に小さい（関連性が弱い）場合は、オリジナル格言を生成しない
+    if abs(selected_vow_value) < 0.1:
+        return None
+    
+    # 神のVOW値から関連する誓願を取得（VOW値の絶対値が大きい順）
+    vow_scores = []
+    for i in range(12):
+        v_key = f"vow{i+1:02d}"
+        if v_key in vows:
+            vow_scores.append((i, float(vows[v_key])))
+    vow_scores.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    # 格言データベースから、選ばれた誓願と関連する誓願に対応する格言を選択
+    selected_maxims = []
+    
+    # 選ばれた誓願に対応する格言を優先的に選択
+    # VOW値が負（強い関連性）の場合、より多くの格言を選択
+    num_maxims_to_select = max(2, min(top_k + 1, int(abs(selected_vow_value) * 5) + 2))
+    
+    # ランダムに格言を選択（多様性を確保）
+    import time
+    random.seed(int(time.time() * 1000) % 1000000)
+    available_maxims = [m for m in MAXIMS_DATABASE if m.get("text")]
+    random.shuffle(available_maxims)
+    
+    # 選ばれた誓願に関連する格言を選択
+    for maxim in available_maxims:
+        if len(selected_maxims) >= num_maxims_to_select:
+            break
+        maxim_text = maxim.get("text", "")
+        if maxim_text and maxim_text not in [m.get("text", "") for m in selected_maxims]:
+            selected_maxims.append(maxim)
+    
+    # 格言が少ない場合、神のデフォルト格言を追加
+    if len(selected_maxims) < 2:
+        god_maxim = god.get("maxim", "")
+        if god_maxim and god_maxim not in [m.get("text", "") for m in selected_maxims]:
+            selected_maxims.append({"text": god_maxim, "source": god.get("name", "神託"), "tags": []})
+    
+    # 格言を部分的に組み合わせてオリジナルな格言を生成
+    if len(selected_maxims) >= 2:
+        # 複数の格言から重要なフレーズを抽出して組み合わせ
+        phrases = []
+        for maxim in selected_maxims[:min(3, len(selected_maxims))]:  # 最大3つの格言を使用
+            text = maxim.get("text", "")
+            if text:
+                # 句点や読点で分割
+                parts = re.split(r'[。、，]', text)
+                # 空でない部分を追加（3文字以上）
+                phrases.extend([p.strip() for p in parts if p.strip() and len(p.strip()) >= 3])
+        
+        if len(phrases) >= 2:
+            # ランダムに2-3つのフレーズを選択して組み合わせ
+            random.shuffle(phrases)
+            selected_phrases = phrases[:min(3, len(phrases))]
+            
+            # フレーズを組み合わせ（句点で区切る）
+            combined = "。".join(selected_phrases)
+            if not combined.endswith("。"):
+                combined += "。"
+            
+            # 長すぎる場合は短縮
+            if len(combined) > 100:
+                combined = combined[:100] + "..."
+            
+            return combined
+    
+    # 組み合わせができない場合、Noneを返す（通常の格言選択にフォールバック）
+    return None
 
 # -------------------------
 # キーワード抽出とネットワーク構築（Cell 4用）
@@ -2562,29 +2781,44 @@ def place_words_on_sphere(n_words: int, center_indices: List[int]) -> np.ndarray
     
     return positions
 
-def select_relevant_quote(keywords: List[str]) -> str:
-    """キーワードに基づいて関連する格言を選択（毎回異なる結果を得るため、ランダム要素を追加）"""
+def select_relevant_quote(
+    keywords: List[str],
+    exclude_quotes: Optional[set] = None
+) -> str:
+    """キーワードに基づいて関連する格言を選択（毎回異なる結果を得るため、ランダム要素を追加）
+    
+    Args:
+        keywords: キーワードリスト
+        exclude_quotes: 除外する格言のセット（重複を避けるため）
+    """
     # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
     import time
     random.seed(int(time.time() * 1000) % 1000000)
     
+    exclude_set = exclude_quotes or set()
     keyword_set = set(keywords)
     scored_quotes = []
     
     for quote_data in FAMOUS_QUOTES:
+        quote_text = quote_data["quote"]
+        # 除外リストに含まれている場合はスキップ
+        if quote_text in exclude_set:
+            continue
+            
         quote_keywords = set(quote_data["keywords"])
         score = len(keyword_set & quote_keywords)
         # スコアに小さなランダム要素を追加して、毎回異なる結果を得る
         score += random.uniform(-0.3, 0.3)
-        scored_quotes.append((score, quote_data["quote"]))
+        scored_quotes.append((score, quote_text))
     
     # スコアでソート
     scored_quotes.sort(key=lambda x: x[0], reverse=True)
     
-    # 上位3つからランダムに選択（多様性を確保）
+    # 上位10個からランダムに選択（多様性を確保）
     if scored_quotes:
-        top_quotes = [q for _, q in scored_quotes[:3]]
-        return random.choice(top_quotes)
+        top_quotes = [q for _, q in scored_quotes[:min(10, len(scored_quotes))]]
+        if top_quotes:
+            return random.choice(top_quotes)
     
     return "あなたの観測が、この世界線を確定させました。"
 
@@ -3117,13 +3351,34 @@ def main():
             
             # 結果表示
             st.subheader("低エネルギー上位（選ばれた格言の重なり）")
+            displayed_maxims_basic = []  # 既に表示した格言を記録（重複を避ける）
             for rank, (e, x) in enumerate(sols[:8], start=1):
                 # 階層構造の場合、キャラクターと格言を取得
                 if len(x) >= 32:
                     selected_god = get_selected_god_from_x(x, default_mood, use_hierarchical=True)
-                    picks = select_maxims_for_god(selected_god, context_text="", top_k=2, include_famous_quote=False)
-                    if picks:
-                        picks_str = " | ".join(picks[:2])
+                    selected_vow_idx = get_selected_vow_from_x(x, use_hierarchical=True)
+                    picks = select_maxims_for_god(
+                        selected_god, 
+                        context_text="", 
+                        top_k=3,  # より多くの候補から選択
+                        include_famous_quote=False,
+                        selected_vow_index=selected_vow_idx,
+                        exclude_maxims=displayed_maxims_basic  # 既に表示した格言を除外
+                    )
+                    
+                    # 既に表示した格言を除外して、新しい格言のみを表示
+                    new_picks = [p for p in picks if p not in displayed_maxims_basic]
+                    if not new_picks and picks:
+                        # 新しい格言がない場合、最初の格言を使用（重複を許容）
+                        new_picks = picks[:1]
+                    
+                    # 表示する格言を記録
+                    for pick in new_picks:
+                        if pick not in displayed_maxims_basic:
+                            displayed_maxims_basic.append(pick)
+                    
+                    if new_picks:
+                        picks_str = " | ".join(new_picks[:2])
                     else:
                         picks_str = selected_god.get("maxim", "今この瞬間を大切に")
                 else:
@@ -3284,11 +3539,34 @@ def main():
                 
                 # 候補Top3
                 st.subheader("低エネルギー候補（選ばれた格言の重ね合わせ）Top3")
+                displayed_maxims = []  # 既に表示した格言を記録（重複を避ける）
                 for rank, (e, x) in enumerate(sols[:3], start=1):
                     god_for_candidate = get_selected_god_from_x(x, m, use_hierarchical=True)
-                    picks = select_maxims_for_god(god_for_candidate, context_text=user_text, top_k=2, include_famous_quote=False)
+                    selected_vow_idx = get_selected_vow_from_x(x, use_hierarchical=True)
+                    
+                    # 既に表示した格言を除外
+                    picks = select_maxims_for_god(
+                        god_for_candidate, 
+                        context_text=user_text, 
+                        top_k=3,  # より多くの候補から選択
+                        include_famous_quote=False,
+                        selected_vow_index=selected_vow_idx,
+                        exclude_maxims=displayed_maxims  # 既に表示した格言を除外
+                    )
+                    
+                    # 既に表示した格言を除外して、新しい格言のみを表示
+                    new_picks = [p for p in picks if p not in displayed_maxims]
+                    if not new_picks and picks:
+                        # 新しい格言がない場合、最初の格言を使用（重複を許容）
+                        new_picks = picks[:1]
+                    
+                    # 表示する格言を記録
+                    for pick in new_picks:
+                        if pick not in displayed_maxims:
+                            displayed_maxims.append(pick)
+                    
                     st.write(f"**{rank}. E={e:.3f}**")
-                    for pick in picks:
+                    for pick in new_picks[:2]:  # 最大2つまで表示
                         source_info = get_maxim_source(pick)
                         st.write(f"   • {pick}")
                         st.caption(f"     *出典: {source_info['source']} - {source_info['origin']}*")
@@ -3385,8 +3663,18 @@ def main():
                     st.markdown("---")
                     st.subheader("関連する格言")
                     
-                    # キーワードに基づいて格言を選択
-                    quote_text = select_relevant_quote(keywords)
+                    # キーワードに基づいて格言を選択（重複を避ける）
+                    if 'recent_maxims' not in st.session_state:
+                        st.session_state.recent_maxims = []
+                    exclude_quotes = set(st.session_state.recent_maxims[-10:])
+                    quote_text = select_relevant_quote(keywords, exclude_quotes=exclude_quotes)
+                    
+                    # 選択した格言を履歴に追加
+                    if quote_text and quote_text not in st.session_state.recent_maxims:
+                        st.session_state.recent_maxims.append(quote_text)
+                        if len(st.session_state.recent_maxims) > 20:
+                            st.session_state.recent_maxims.pop(0)
+                    
                     st.success(f"「{quote_text}」")
                     
                     # 引用元を表示
@@ -3441,8 +3729,18 @@ def main():
                 fig = create_3d_network_plot(network, positions, center_indices)
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # 格言を表示
-                quote_text = select_relevant_quote(keywords)
+                # 格言を表示（重複を避ける）
+                if 'recent_maxims' not in st.session_state:
+                    st.session_state.recent_maxims = []
+                exclude_quotes = set(st.session_state.recent_maxims[-10:])
+                quote_text = select_relevant_quote(keywords, exclude_quotes=exclude_quotes)
+                
+                # 選択した格言を履歴に追加
+                if quote_text and quote_text not in st.session_state.recent_maxims:
+                    st.session_state.recent_maxims.append(quote_text)
+                    if len(st.session_state.recent_maxims) > 20:
+                        st.session_state.recent_maxims.pop(0)
+                
                 st.markdown("---")
                 st.subheader("神託（Oracle）")
                 st.success(f"「{quote_text}」")
