@@ -21,6 +21,14 @@ import os
 import requests
 import json
 
+# Janome for Japanese morphological analysis (長期的改善)
+try:
+    from janome.tokenizer import Tokenizer
+    JANOME_AVAILABLE = True
+except ImportError:
+    JANOME_AVAILABLE = False
+    Tokenizer = None
+
 # Optuna for QUBO optimization visualization
 try:
     import optuna
@@ -71,10 +79,10 @@ def _parse_tagged_quote(line: str) -> Dict[str, object]:
         return {"text": quote, "tags": tags}
     return {"text": raw, "tags": []}
 
-def extract_keywords_safe(text: str, top_n: int = 6) -> List[str]:
-    """UI/最適化用のキーワード抽出（失敗しても落とさない）"""
+def extract_keywords_safe(text: str, top_n: int = 6, use_llm: bool = False, llm_type: str = "huggingface") -> List[str]:
+    """UI/最適化用のキーワード抽出（失敗しても落とさない + LLMオプション）"""
     try:
-        keywords = extract_keywords(text, top_n=top_n)  # 既存関数を利用（後方で定義される）
+        keywords = extract_keywords(text, top_n=top_n, use_llm=use_llm, llm_type=llm_type)  # 既存関数を利用（後方で定義される）
         # キーワードが抽出されない場合、フォールバック処理
         if not keywords:
             t = (text or "").strip()
@@ -493,6 +501,33 @@ KEYWORDS = {
     "decisiveness": [
         "決め", "結論", "選", "判断", "断", "方針", "期限", "決断",
         "自信", "持てない", "迷う", "悩む", "躊躇", "ためら", "優柔不断"
+    ],
+    # 【追加】願い・祈り・希望のカテゴリ
+    "wish": [
+        "願い", "祈り", "希望", "願う", "祈る", "望む", "願望", "切望",
+        "でありますように", "ように", "であります", "ありますように",
+        "できますように", "なりますように", "過ごせますように"
+    ],
+    # 【追加】家族・関係性のカテゴリ
+    "family": [
+        "家族", "夫婦", "親", "子", "兄弟", "姉妹", "祖父母", "親戚",
+        "家庭", "生活", "円満", "仲良く", "幸せ", "平和", "調和",
+        "絆", "つながり", "愛情", "思いやり", "支え", "協力"
+    ],
+    # 【追加】健康・体調のカテゴリ
+    "health": [
+        "健康", "体調", "身体", "体", "病気", "治療", "回復", "元気",
+        "過ごしたい", "過ごせますように", "健やか", "丈夫", "強く"
+    ],
+    # 【追加】仕事・キャリアのカテゴリ
+    "work": [
+        "仕事", "職場", "キャリア", "働く", "就職", "転職", "昇進",
+        "成功", "成果", "達成", "目標", "プロジェクト", "業務"
+    ],
+    # 【追加】学び・成長のカテゴリ
+    "learning": [
+        "学び", "学習", "勉強", "教育", "知識", "スキル", "向上",
+        "成長", "発展", "進歩", "習得", "理解", "覚える"
     ],
 }
 
@@ -2573,6 +2608,66 @@ def generate_with_ollama(prompt: str, model: str = "llama3.2") -> str:
         # Ollamaが起動していない場合など
         return ""
 
+def extract_keywords_with_llm(text: str, llm_type: str = "huggingface") -> List[str]:
+    """LLMを使用してキーワードと意図を抽出（中期的改善）
+    
+    Args:
+        text: 入力テキスト
+        llm_type: LLMの種類（"ollama" or "huggingface"）
+    
+    Returns:
+        抽出されたキーワードのリスト
+    """
+    prompt = f"""以下の日本語の文章から、重要なキーワードとユーザーの意図を抽出してください。
+
+文章：「{text}」
+
+以下の形式で回答してください：
+- 重要なキーワード（名詞や重要な概念）を3-5個、カンマ区切りで
+- ユーザーの意図（願い、悩み、希望など）を1つ
+
+例：
+キーワード: 夫婦, 生活, 円満, 家族
+意図: 家族の幸せを願う
+
+回答："""
+    
+    try:
+        if llm_type == "ollama":
+            response = generate_with_ollama(prompt, model="llama3.2")
+        elif llm_type == "huggingface":
+            response = generate_with_huggingface(prompt, model="microsoft/DialoGPT-medium")
+        else:
+            return []
+        
+        if not response:
+            return []
+        
+        # レスポンスからキーワードを抽出
+        keywords = []
+        lines = response.strip().split('\n')
+        for line in lines:
+            if 'キーワード' in line or 'keyword' in line.lower():
+                # 「キーワード: 夫婦, 生活, 円満」のような形式から抽出
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    kw_text = parts[1].strip()
+                    # カンマ区切りで分割
+                    kw_list = [kw.strip() for kw in kw_text.split(',')]
+                    keywords.extend(kw_list)
+        
+        # キーワードが見つからない場合、レスポンス全体から抽出を試みる
+        if not keywords:
+            # レスポンスから日本語の単語を抽出（2文字以上）
+            import re
+            japanese_words = re.findall(r'[ひらがなカタカナ一-龠]{2,}', response)
+            keywords = [w for w in japanese_words if len(w) <= 8][:5]
+        
+        return keywords
+    except Exception as e:
+        # LLMが使用できない場合、空のリストを返す
+        return []
+
 def generate_with_huggingface(prompt: str, model: str = "microsoft/DialoGPT-medium") -> str:
     """Hugging Face Inference APIを使用してテキストを生成（無料枠）
     
@@ -2913,14 +3008,55 @@ def create_original_maxim_from_vow(
 # -------------------------
 # キーワード抽出とネットワーク構築（Cell 4用）
 # -------------------------
-def extract_keywords(text: str, top_n: int = 5) -> List[str]:
-    """テキストからキーワードを抽出（改善版：日本語対応強化）"""
+def extract_keywords(text: str, top_n: int = 5, use_llm: bool = False, llm_type: str = "huggingface") -> List[str]:
+    """テキストからキーワードを抽出（改善版：日本語対応強化 + LLMオプション）
+    
+    Args:
+        text: 入力テキスト
+        top_n: 抽出するキーワードの最大数
+        use_llm: LLMを使用してキーワード抽出を行うか
+        llm_type: LLMの種類（"ollama" or "huggingface"）
+    """
     if not text or not text.strip():
         return []
+    
+    # 【中期的改善】LLMを使用してキーワード抽出を行う場合
+    if use_llm:
+        llm_keywords = extract_keywords_with_llm(text, llm_type=llm_type)
+        if llm_keywords:
+            return llm_keywords[:top_n]
     
     found_keywords = []
     text_original = text.strip()
     text_lower = text_original.lower()
+    
+    # 【短期的改善】文脈パターンの検出（願い・祈りのパターン）
+    context_patterns = {
+        "wish": [
+            r"でありますように", r"ように", r"であります", r"ありますように",
+            r"できますように", r"なりますように", r"過ごせますように",
+            r"願い", r"祈り", r"希望", r"願う", r"祈る", r"望む"
+        ],
+        "family": [
+            r"家族", r"夫婦", r"親", r"子", r"家庭", r"生活", r"円満"
+        ],
+        "health": [
+            r"健康", r"体調", r"身体", r"過ごしたい", r"過ごせますように"
+        ]
+    }
+    
+    # 文脈パターンに基づいてカテゴリを検出
+    detected_categories = []
+    for category, patterns in context_patterns.items():
+        for pattern in patterns:
+            if re.search(pattern, text_original):
+                detected_categories.append(category)
+                # カテゴリに対応するキーワードを追加
+                if category in KEYWORDS:
+                    for kw in KEYWORDS[category]:
+                        if kw not in found_keywords:
+                            found_keywords.append(kw)
+                break
     
     # 1. KEYWORDS辞書から関連キーワードを抽出（最優先：ユーザー入力の分析）
     # 例：「疲れていて決断が出来ない」→「疲」「決断」を抽出
@@ -3019,6 +3155,30 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
                     # 短すぎる単語（1-2文字）は除外（ただし、GLOBAL_WORDS_DATABASEに含まれる場合はOK）
                     if len(word) >= 2 or word in GLOBAL_WORDS_DATABASE:
                         found_keywords.append(word)
+    
+    # 【長期的改善】Janomeを使用した形態素解析（より正確な分割）
+    if JANOME_AVAILABLE:
+        try:
+            tokenizer = Tokenizer()
+            tokens = tokenizer.tokenize(text_original)
+            for token in tokens:
+                # 名詞、動詞、形容詞のみを抽出
+                pos = token.part_of_speech.split(',')[0]
+                if pos in ['名詞', '動詞', '形容詞']:
+                    surface = token.surface
+                    # 長すぎる単語を除外
+                    if 2 <= len(surface) <= 8 and surface not in found_keywords:
+                        # 助詞・助動詞を除外
+                        stop_words_list = [
+                            'こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
+                            'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか',
+                            'が', 'を', 'に', 'で', 'と', 'て', 'た', 'だ'
+                        ]
+                        if surface not in stop_words_list:
+                            found_keywords.append(surface)
+        except Exception:
+            # Janomeが使用できない場合、従来の方法を使用
+            pass
     
     # 4. テキストを単語に分割して、2文字以上の単語を抽出（英語やスペース区切りの場合）
     text_clean = re.sub(r'[0-9０-９\W]+', ' ', text_original)
