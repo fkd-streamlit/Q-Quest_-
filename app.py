@@ -3091,9 +3091,24 @@ def main():
             st.subheader("量子おみくじ（Quantum Oracle）")
             
             # 選ばれた神のキャラクターを表示
-            if 'god' in card and card['god']:
-                selected_god = card['god']
-                character_html = render_god_character(selected_god, LOADED_GODS)
+            # プルダウンで選択されたキャラクターを優先
+            display_god = None
+            if SELECTED_CHARACTER and LOADED_GODS:
+                # 選択されたキャラクターをLOADED_GODSから検索
+                for god in LOADED_GODS:
+                    god_official_name = god.get("公式キャラ名", "")
+                    god_name = god.get("name", "")
+                    if SELECTED_CHARACTER == god_official_name or SELECTED_CHARACTER == god_name:
+                        display_god = god
+                        break
+            
+            # 選択されたキャラクターが見つからない場合、QUBOの結果から選ばれた神を使用
+            if display_god is None and 'god' in card and card['god']:
+                display_god = card['god']
+            
+            # キャラクターを表示
+            if display_god:
+                character_html = render_god_character(display_god, LOADED_GODS)
                 st.components.v1.html(character_html, height=400)
             
             st.write(f"**エネルギー**: {card['energy']:.3f}")
