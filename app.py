@@ -2311,25 +2311,28 @@ def oracle_card(
     # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
     # QUBOで選ばれた誓願（VOW）の情報を使用
     if use_hierarchical:
+        # ユーザー入力がある場合、より多くの候補から選択（キーワードに基づいて絞り込む）
+        top_k_for_selection = 5 if context_text else 2
         picks = select_maxims_for_god(
             selected_god, 
-            context_text=context_text, 
-            top_k=2, 
+            context_text=context_text,  # ユーザー入力を使用
+            top_k=top_k_for_selection, 
             include_famous_quote=True,
             exclude_maxims=exclude_maxims,
             selected_vow_index=selected_vow_index
         )
         
-        # 格言データベースからも追加で選択
+        # 格言データベースからも追加で選択（ユーザー入力がある場合、キーワードに基づいて選択）
         if MAXIMS_DATABASE and context_text:
-            keywords = extract_keywords_safe(context_text, top_n=5)
-            db_maxims = select_maxims_from_database(keywords, top_k=2, exclude_maxims=exclude_maxims)
-            for db_maxim in db_maxims:
-                maxim_text = db_maxim.get("text", "")
-                if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
-                    picks.append(maxim_text)
-                    if len(picks) >= 4:
-                        break
+            keywords = extract_keywords_safe(context_text, top_n=8)
+            if keywords:
+                db_maxims = select_maxims_from_database(keywords, top_k=4, exclude_maxims=exclude_maxims)
+                for db_maxim in db_maxims:
+                    maxim_text = db_maxim.get("text", "")
+                    if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
+                        picks.append(maxim_text)
+                        if len(picks) >= 6:  # より多くの候補から選択
+                            break
         
         # QUBOで選ばれた誓願（VOW）のベクトルに基づいてオリジナルな格言を生成
         if selected_vow_index is not None:
@@ -2355,13 +2358,24 @@ def oracle_card(
         picks = picks_from_x(x, use_hierarchical=use_hierarchical, selected_god=selected_god)
     
     # 格言が空またはデフォルトの場合、選ばれた神の格言を使用
+    # ただし、context_textがある場合は、キーワードに基づいて再試行
     if not picks or (len(picks) == 1 and picks[0] == "今この瞬間を大切に。すべては縁で繋がっている。"):
-        if selected_god and selected_god.get("maxim"):
-            picks = [selected_god["maxim"]]
-        elif selected_god and selected_god.get("description"):
-            picks = [selected_god["description"]]
-        else:
-            picks = ["今この瞬間を大切に。すべては縁で繋がっている。"]
+        # context_textがある場合、キーワードに基づいて再試行
+        if context_text and MAXIMS_DATABASE:
+            keywords = extract_keywords_safe(context_text, top_n=8)
+            if keywords:
+                db_maxims = select_maxims_from_database(keywords, top_k=3, exclude_maxims=exclude_maxims)
+                if db_maxims:
+                    picks = [m.get("text", "") for m in db_maxims if m.get("text")]
+        
+        # それでも格言がない場合、選ばれた神の格言を使用
+        if not picks or (len(picks) == 1 and picks[0] == "今この瞬間を大切に。すべては縁で繋がっている。"):
+            if selected_god and selected_god.get("maxim"):
+                picks = [selected_god["maxim"]]
+            elif selected_god and selected_god.get("description"):
+                picks = [selected_god["description"]]
+            else:
+                picks = ["今この瞬間を大切に。すべては縁で繋がっている。"]
     
     season = random.choice(SEASONS)
     
@@ -3615,7 +3629,19 @@ def main():
                 st.plotly_chart(fig_bar, use_container_width=True)
             
             # おみくじ（基本デモでも階層構造を使用）
-            oracle_pool = sols[:6]
+            # より多くの候補から選択（ユーザー入力がある場合、より多様な結果を得るため）
+            pool_size = 10 if context_text_for_basic else 6
+            oracle_pool = sols[:pool_size]
+            
+            # 毎回異なる結果を得るため、ランダム要素を追加
+            import time
+            random.seed(int(time.time() * 1000) % 1000000)
+            # プールを少しシャッフルして多様性を確保
+            if len(oracle_pool) > 1:
+                shuffled_pool = list(oracle_pool)
+                random.shuffle(shuffled_pool[:min(5, len(shuffled_pool))])
+                oracle_pool = shuffled_pool
+            
             T = temperature_from_mood(user_mood, SELECTED_CHARACTER)
             e_pick, x_pick = boltzmann_sample(oracle_pool, T=T)
             card = oracle_card(e_pick, x_pick, mood=user_mood, use_hierarchical=True, context_text=context_text_for_basic)
