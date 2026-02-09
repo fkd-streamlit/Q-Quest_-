@@ -60,7 +60,18 @@ def _parse_tagged_quote(line: str) -> Dict[str, object]:
 def extract_keywords_safe(text: str, top_n: int = 6) -> List[str]:
     """UI/最適化用のキーワード抽出（失敗しても落とさない）"""
     try:
-        return extract_keywords(text, top_n=top_n)  # 既存関数を利用（後方で定義される）
+        keywords = extract_keywords(text, top_n=top_n)  # 既存関数を利用（後方で定義される）
+        # キーワードが抽出されない場合、フォールバック処理
+        if not keywords:
+            t = (text or "").strip()
+            if not t:
+                return []
+            # 簡易: 2文字以上の連続を上位
+            import re
+            text_clean = re.sub(r'[0-9０-９\W]+', ' ', t)
+            words = text_clean.split()
+            keywords = [w for w in words if len(w) >= 2][:top_n]
+        return keywords
     except Exception:
         # extract_keywords 定義前に呼ばれた等の保険
         t = (text or "").strip()
@@ -1993,7 +2004,15 @@ def select_maxims_for_god(
 
     exclude_set = set(exclude_maxims or [])
     ctx = (context_text or "").strip()
-    keywords = extract_keywords_safe(ctx, top_n=6) if ctx else []
+    keywords = extract_keywords_safe(ctx, top_n=8) if ctx else []  # より多くのキーワードを抽出
+    
+    # キーワードが抽出されない場合、コンテキストテキストから直接単語を抽出
+    if not keywords and ctx:
+        # テキストを単語に分割して、2文字以上の単語を抽出
+        import re
+        text_clean = re.sub(r'[0-9０-９\W]+', ' ', ctx)
+        words = text_clean.split()
+        keywords = [w for w in words if len(w) >= 2][:8]
 
     # 候補（maxims があればそれを、なければ maxim/description）
     maxims = god.get("maxims") or []
@@ -2015,6 +2034,15 @@ def select_maxims_for_god(
             if default_text not in exclude_set:
                 items = [{"text": default_text, "tags": []}]
     
+    # キーワードがある場合、MAXIMS_DATABASEからキーワードに基づいて格言を追加
+    if keywords and MAXIMS_DATABASE:
+        # キーワードに基づいてMAXIMS_DATABASEから格言を選択
+        db_maxims = select_maxims_from_database(keywords, top_k=5, exclude_maxims=list(exclude_set))
+        for maxim in db_maxims:
+            maxim_text = maxim.get("text", "")
+            if maxim_text and maxim_text not in [it.get("text", "") for it in items]:
+                items.append({"text": maxim_text, "tags": maxim.get("tags", [])})
+    
     # キーワードがない場合、格言データベースからも追加で候補を取得（多様性を確保）
     if not keywords and MAXIMS_DATABASE:
         # ランダムにいくつかの格言を追加候補として取得
@@ -2031,20 +2059,41 @@ def select_maxims_for_god(
     def score_item(item: Dict[str, object], item_index: int) -> float:
         text = str(item.get("text", "") or "")
         tags = [str(t) for t in (item.get("tags") or [])]
+        text_lower = text.lower()
+        tags_lower = [str(t).lower() for t in tags]
         s = 0.0
         
         # キーワードベースのスコアリング（最優先：ユーザー入力の分析結果）
         if keywords:
+            matched_keywords = 0
             # タグ一致を最優先（ユーザー入力の分析結果を反映）
             for kw in keywords:
-                if kw in tags:
+                kw_lower = kw.lower()
+                # タグ完全一致
+                if kw_lower in tags_lower:
                     s += 10.0  # タグ一致は最高スコア（ユーザー入力の分析結果を最優先）
-                if kw and kw in text:
+                    matched_keywords += 1
+                # タグ部分一致
+                elif any(kw_lower in tag_lower for tag_lower in tags_lower):
+                    s += 8.0  # タグ部分一致も高スコア
+                    matched_keywords += 1
+                # テキスト完全一致
+                elif kw_lower in text_lower:
                     s += 3.0  # テキスト内のキーワード一致も高スコア
+                    matched_keywords += 1
+                # テキスト部分一致（より柔軟なマッチング：日本語対応）
+                # 日本語の場合は単語分割が難しいため、文字列全体で部分一致をチェック
+                elif kw_lower in text_lower:
+                    s += 1.5  # 部分一致もスコアに加算
+                    matched_keywords += 1
+                # さらに柔軟なマッチング：キーワードの文字が含まれているか
+                elif any(c in text_lower for c in kw_lower if len(c) >= 1):
+                    s += 0.8  # 文字レベルでの一致も考慮
+                    matched_keywords += 1
+            
             # キーワードが複数一致する場合、ボーナス
-            matched_keywords = sum(1 for kw in keywords if kw in text or kw in tags)
             if matched_keywords >= 2:
-                s += 2.0  # 複数キーワード一致のボーナス
+                s += 2.0 * matched_keywords  # 複数キーワード一致のボーナス（一致数に応じて増加）
         
         # QUBOで選ばれた誓願（VOW）に基づくスコアリング（キーワードがない場合の補助）
         if selected_vow_index is not None:
@@ -2089,12 +2138,46 @@ def select_maxims_for_god(
             break
 
     # 全部スコアが低い（=キーワードに引っかからない）なら、ランダムに複数提示
-    if scored and scored[0][0] < 1.0:  # スコアが1.0未満の場合
-        all_texts = [t for _, t in scored if t and t not in exclude_set]
-        # 再度ランダムシードを設定して多様性を確保
-        random.seed(int(time.time() * 1000) % 1000000 + god_id * 200 + len(all_texts))
-        random.shuffle(all_texts)
-        picks = list(dict.fromkeys(all_texts))[:max(1, top_k)]
+    # ただし、キーワードがある場合は、スコアが低くてもキーワードに基づいて選択
+    if scored:
+        if keywords and scored[0][0] < 1.0:
+            # キーワードがあるがスコアが低い場合、キーワードに基づいて再スコアリング
+            # 部分一致や類似語も考慮して、より柔軟にマッチング
+            rescored = []
+            for s, t in scored:
+                text_lower = t.lower()
+                new_score = s
+                # キーワードの部分一致をチェック（日本語対応）
+                for kw in keywords:
+                    kw_lower = kw.lower()
+                    if kw_lower in text_lower:
+                        new_score += 2.0  # 部分一致でもスコアを上げる（重要）
+                    # キーワードの文字が含まれている場合も考慮
+                    elif any(c in text_lower for c in kw_lower if len(c) >= 1):
+                        new_score += 1.0  # 文字レベルでの一致も考慮
+                rescored.append((new_score, t))
+            rescored.sort(key=lambda t: t[0], reverse=True)
+            scored = rescored
+        
+        # キーワードがある場合、スコアが低くてもキーワードに基づいて選択
+        if keywords and scored and scored[0][0] < 3.0:
+            # キーワードに基づいて再選択（MAXIMS_DATABASEからも追加で取得）
+            if MAXIMS_DATABASE:
+                db_maxims = select_maxims_from_database(keywords, top_k=top_k * 2, exclude_maxims=list(exclude_set))
+                for maxim in db_maxims:
+                    maxim_text = maxim.get("text", "")
+                    if maxim_text and maxim_text not in picks and maxim_text not in exclude_set:
+                        picks.append(maxim_text)
+                        if len(picks) >= top_k:
+                            break
+        
+        # キーワードがない場合、またはスコアが非常に低い場合のみランダム選択
+        if not keywords and scored and scored[0][0] < 1.0:
+            all_texts = [t for _, t in scored if t and t not in exclude_set]
+            # 再度ランダムシードを設定して多様性を確保
+            random.seed(int(time.time() * 1000) % 1000000 + god_id * 200 + len(all_texts))
+            random.shuffle(all_texts)
+            picks = list(dict.fromkeys(all_texts))[:max(1, top_k)]
 
     # 有名名言も1つ混ぜる（任意）
     if include_famous_quote and keywords:
@@ -2514,15 +2597,29 @@ def select_maxims_from_database(
         maxim_text_lower = maxim_text.lower()
         maxim_tags = [tag.lower() for tag in maxim.get("tags", [])]
         
-        # タグ一致を優先
+        # タグ一致を優先（完全一致）
         for tag in maxim_tags:
             if tag in keyword_set:
+                score += 5.0  # タグ一致は高スコア
+            # タグ部分一致も考慮
+            elif any(kw in tag for kw in keyword_set):
                 score += 3.0
         
-        # テキスト内のキーワード一致
+        # テキスト内のキーワード一致（日本語対応：部分一致も考慮）
+        matched_count = 0
         for kw in keyword_set:
+            # 完全一致
             if kw in maxim_text_lower:
-                score += 1.0
+                score += 2.0  # テキスト内のキーワード一致は高スコア
+                matched_count += 1
+            # 部分一致（日本語の場合、単語の境界が明確でないため）
+            elif any(c in maxim_text_lower for c in kw if len(c) >= 1):
+                score += 1.0  # 部分一致もスコアに加算
+                matched_count += 1
+        
+        # 複数キーワード一致のボーナス
+        if matched_count >= 2:
+            score += matched_count * 1.5
         
         if score > 0:
             scored_maxims.append((score, maxim))
@@ -2643,15 +2740,72 @@ def create_original_maxim_from_vow(
 # キーワード抽出とネットワーク構築（Cell 4用）
 # -------------------------
 def extract_keywords(text: str, top_n: int = 5) -> List[str]:
-    text_clean = re.sub(r'[0-9０-９\W]+', ' ', text)
+    """テキストからキーワードを抽出（改善版：日本語対応強化）"""
+    if not text or not text.strip():
+        return []
+    
     found_keywords = []
+    text_original = text.strip()
+    text_lower = text_original.lower()
+    
+    # 1. KEYWORDS辞書から関連キーワードを抽出（最優先：ユーザー入力の分析）
+    # 例：「疲れていて決断が出来ない」→「疲」「決断」を抽出
+    for category, keywords in KEYWORDS.items():
+        for kw in keywords:
+            # 部分一致で検索（「疲れ」に「疲」が含まれる）
+            if kw in text_lower or text_lower in kw:
+                if kw not in found_keywords:
+                    found_keywords.append(kw)
+            # より柔軟なマッチング：キーワードの文字が含まれているか
+            elif any(c in text_lower for c in kw if len(c) >= 1):
+                # 「疲れ」に「疲」が含まれる場合
+                if len(kw) >= 2 and kw[:2] in text_lower:
+                    if kw not in found_keywords:
+                        found_keywords.append(kw)
+    
+    # 2. GLOBAL_WORDS_DATABASEから一致するキーワードを抽出
     for word in GLOBAL_WORDS_DATABASE:
-        if word in text_clean:
-            found_keywords.append(word)
-    if not found_keywords:
-        words = text_clean.split()
-        found_keywords = [w for w in words if len(w) >= 2][:top_n]
-    return found_keywords[:top_n]
+        if word in text_original or word in text_lower:
+            if word not in found_keywords:
+                found_keywords.append(word)
+    
+    # 3. 日本語の形態素解析的なアプローチ：文字列から意味のある単語を抽出
+    # 「疲れていて決断が出来ない」→「疲れ」「決断」を抽出
+    # 動詞の語幹や名詞を抽出する簡易版
+    import re
+    # ひらがな・カタカナ・漢字の連続を抽出
+    japanese_words = re.findall(r'[ひらがなカタカナ一-龠]+', text_original)
+    for word in japanese_words:
+        if len(word) >= 2 and word not in found_keywords:
+            # 助詞や助動詞を除外
+            stop_words = ['こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
+                         'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか',
+                         'ていて', 'が', 'を', 'に', 'で', 'と', 'から', 'まで', 'より', 'ので',
+                         '出来ない', 'できない', '出来る', 'できる', 'である', 'です', 'ます']
+            if word not in stop_words and not any(sw in word for sw in stop_words):
+                # 既存のキーワードの一部でないかチェック
+                is_substring = any(word in kw or kw in word for kw in found_keywords if len(kw) > len(word))
+                if not is_substring:
+                    found_keywords.append(word)
+    
+    # 4. テキストを単語に分割して、2文字以上の単語を抽出（英語やスペース区切りの場合）
+    text_clean = re.sub(r'[0-9０-９\W]+', ' ', text_original)
+    words = text_clean.split()
+    for word in words:
+        if len(word) >= 2 and word not in found_keywords:
+            if word not in ['こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
+                           'でも', 'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか']:
+                found_keywords.append(word)
+    
+    # 5. 重複を除去し、上位N個を返す（KEYWORDS辞書からの抽出を優先）
+    unique_keywords = list(dict.fromkeys(found_keywords))  # 順序を保持しながら重複除去
+    
+    # KEYWORDS辞書からの抽出を優先的に並べる
+    keywords_from_dict = [kw for kw in unique_keywords if any(kw in kws or any(k in kw for k in kws) for kws in KEYWORDS.values() for k in kws)]
+    other_keywords = [kw for kw in unique_keywords if kw not in keywords_from_dict]
+    sorted_keywords = keywords_from_dict + other_keywords
+    
+    return sorted_keywords[:top_n]
 
 def calculate_energy_between_words(
     word1: str, 
@@ -3394,9 +3548,11 @@ def main():
             if context_text_for_basic:
                 st.caption(f"📝 入力文面: 「{context_text_for_basic}」")
                 # 抽出されたキーワードを表示
-                keywords_basic = extract_keywords_safe(context_text_for_basic, top_n=5)
+                keywords_basic = extract_keywords_safe(context_text_for_basic, top_n=8)
                 if keywords_basic:
                     st.caption(f"🔑 抽出されたキーワード: {', '.join(keywords_basic)}")
+                else:
+                    st.warning("⚠️ キーワードが抽出できませんでした。より詳しい文面を入力してください。")
             
             displayed_maxims_basic = []  # 既に表示した格言を記録（重複を避ける）
             for rank, (e, x) in enumerate(sols[:8], start=1):
@@ -3406,10 +3562,12 @@ def main():
                     selected_vow_idx = get_selected_vow_from_x(x, use_hierarchical=True)
                     
                     # ユーザー入力文面を分析して、エネルギーが近い格言を選択
+                    # キーワードを事前に抽出して、より効果的な選択を行う
+                    context_for_selection = context_text_for_basic if context_text_for_basic else ""
                     picks = select_maxims_for_god(
                         selected_god, 
-                        context_text=context_text_for_basic,  # ユーザー入力を使用
-                        top_k=5,  # より多くの候補から選択
+                        context_text=context_for_selection,  # ユーザー入力を使用
+                        top_k=8,  # より多くの候補から選択（キーワードに基づいて絞り込む）
                         include_famous_quote=False,
                         selected_vow_index=selected_vow_idx,
                         exclude_maxims=displayed_maxims_basic  # 既に表示した格言を除外
