@@ -2338,49 +2338,11 @@ def oracle_card(
     
     # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
     # QUBOで選ばれた誓願（VOW）の情報を使用
+    # 【神託寄りにシフト】優先順位を変更：VOWベースの格言生成 > 神の格言 > キーワードベースの格言
     if use_hierarchical:
         picks = []
         
-        # ユーザー入力がある場合、キーワードに基づいて優先的に格言を選択
-        if context_text:
-            # キーワード抽出（より多くのキーワードを抽出）
-            keywords = extract_keywords_safe(context_text, top_n=12)
-            
-            # キーワードに基づいて格言を生成（最優先：ユーザー入力に直接応える）
-            if keywords:
-                generated_maxim = generate_maxim_from_keywords(keywords, context_text)
-                if generated_maxim and generated_maxim not in picks and generated_maxim not in exclude_maxims:
-                    picks.insert(0, generated_maxim)  # 生成された格言を最初に追加
-            
-            # MAXIMS_DATABASEからキーワードに基づいて格言を選択
-            if MAXIMS_DATABASE and keywords:
-                # キーワードに基づいて格言データベースから優先的に選択
-                db_maxims = select_maxims_from_database(keywords, top_k=10, exclude_maxims=exclude_maxims)
-                for db_maxim in db_maxims:
-                    maxim_text = db_maxim.get("text", "")
-                    if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
-                        picks.append(maxim_text)
-                        if len(picks) >= 8:  # キーワードに基づく格言を優先（より多く選択）
-                            break
-        
-        # キーワードに基づく格言がない場合、神の格言から選択
-        if len(picks) < 2:
-            top_k_for_selection = 3 if context_text else 2
-            god_picks = select_maxims_for_god(
-                selected_god, 
-                context_text=context_text,  # ユーザー入力を使用
-                top_k=top_k_for_selection, 
-                include_famous_quote=True,
-                exclude_maxims=exclude_maxims,
-                selected_vow_index=selected_vow_index
-            )
-            for pick in god_picks:
-                if pick and pick not in picks and pick not in exclude_maxims:
-                    picks.append(pick)
-                    if len(picks) >= 5:
-                        break
-        
-        # QUBOで選ばれた誓願（VOW）のベクトルに基づいてオリジナルな格言を生成
+        # 【最優先】QUBOで選ばれた誓願（VOW）のベクトルに基づいてオリジナルな格言を生成（神託らしい）
         if selected_vow_index is not None:
             original_maxim = create_original_maxim_from_vow(
                 selected_vow_index=selected_vow_index,
@@ -2388,10 +2350,51 @@ def oracle_card(
                 top_k=3
             )
             if original_maxim and original_maxim not in picks and original_maxim not in exclude_maxims:
-                # オリジナルな格言を最初に追加（優先表示）
+                # オリジナルな格言を最初に追加（最優先表示：神託らしい）
                 picks.insert(0, original_maxim)
-                if len(picks) > 4:
-                    picks = picks[:4]  # 最大4つまで
+        
+        # 【第2優先】選ばれた神の格言を優先的に選択（神託の核心）
+        # 神の格言は常に含める（入力がない場合も神託として機能）
+        top_k_for_selection = 4 if context_text else 3
+        god_picks = select_maxims_for_god(
+            selected_god, 
+            context_text=context_text,  # ユーザー入力を使用（あれば）
+            top_k=top_k_for_selection, 
+            include_famous_quote=False,  # 有名名言は除外（神託らしさを優先）
+            exclude_maxims=exclude_maxims,
+            selected_vow_index=selected_vow_index
+        )
+        for pick in god_picks:
+            if pick and pick not in picks and pick not in exclude_maxims:
+                picks.append(pick)
+                if len(picks) >= 6:  # 神の格言を優先的に多く選択
+                    break
+        
+        # 【第3優先】ユーザー入力がある場合、キーワードに基づいて格言を選択（補助的）
+        if context_text:
+            # キーワード抽出（より多くのキーワードを抽出）
+            keywords = extract_keywords_safe(context_text, top_n=12)
+            
+            # キーワードに基づいて格言を生成（ユーザー入力に直接応える）
+            if keywords and len(picks) < 4:  # 神の格言が少ない場合のみ
+                generated_maxim = generate_maxim_from_keywords(keywords, context_text)
+                if generated_maxim and generated_maxim not in picks and generated_maxim not in exclude_maxims:
+                    picks.append(generated_maxim)  # 生成された格言を追加（優先度は低め）
+            
+            # MAXIMS_DATABASEからキーワードに基づいて格言を選択（補助的）
+            if MAXIMS_DATABASE and keywords and len(picks) < 5:
+                # キーワードに基づいて格言データベースから選択
+                db_maxims = select_maxims_from_database(keywords, top_k=5, exclude_maxims=exclude_maxims)
+                for db_maxim in db_maxims:
+                    maxim_text = db_maxim.get("text", "")
+                    if maxim_text and maxim_text not in picks and maxim_text not in exclude_maxims:
+                        picks.append(maxim_text)
+                        if len(picks) >= 6:  # 最大6つまで
+                            break
+        
+        # 最大4つまでに制限（神託らしさを保つため、多すぎないように）
+        if len(picks) > 4:
+            picks = picks[:4]
     
     # 選択した格言を履歴に追加（重複を避ける）
     for pick in picks:
@@ -2461,11 +2464,17 @@ def oracle_card(
     
     hint = random.choice(hints)
     
-    # 選ばれた格言を俳句風に表現（選ばれた格言に応じて季節も調整）
+    # 選ばれた格言を俳句風に表現（神託らしく、季節と格言を組み合わせる）
     if len(picks) > 0:
-        # 選ばれた格言の内容に応じて季節を調整（オプション）
-        poem = f"{season}／{picks[0]}"
+        # 神託らしい表現：季節と格言を組み合わせる
+        # 格言が長すぎる場合は短縮して、神託らしくする
+        maxim_text = picks[0]
+        if len(maxim_text) > 30:
+            # 長い格言は最初の部分を取るか、要約
+            maxim_text = maxim_text[:30] + "..."
+        poem = f"{season}／{maxim_text}"
     else:
+        # デフォルトの神託
         poem = f"{season}／今この瞬間を大切に"
     
     return {
@@ -2960,6 +2969,10 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
     ]
     
     for word in japanese_words:
+        # 長すぎる単語（文章全体）を除外（最大8文字まで）
+        if len(word) > 8:
+            continue
+        
         if len(word) >= 2 and word not in found_keywords:
             # 助詞や助動詞を除外（完全一致と部分一致の両方をチェック）
             is_stop_word = word in stop_words or any(sw in word for sw in stop_words if len(sw) >= 2)
@@ -2975,6 +2988,10 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
     text_clean = re.sub(r'[0-9０-９\W]+', ' ', text_original)
     words = text_clean.split()
     for word in words:
+        # 長すぎる単語（文章全体）を除外（最大8文字まで）
+        if len(word) > 8:
+            continue
+        
         if len(word) >= 2 and word not in found_keywords:
             if word not in ['こと', 'もの', 'とき', 'ため', 'から', 'まで', 'より', 'ので', 'のに', 
                            'でも', 'でも', 'など', 'とか', 'だけ', 'ばかり', 'くらい', 'ほど', 'しか']:
@@ -2983,16 +3000,19 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
     # 5. 重複を除去し、上位N個を返す（優先順位：GLOBAL_WORDS_DATABASE > KEYWORDS辞書 > その他）
     unique_keywords = list(dict.fromkeys(found_keywords))  # 順序を保持しながら重複除去
     
+    # 文章全体（長すぎる単語）を除外（最大8文字まで）
+    filtered_keywords = [kw for kw in unique_keywords if len(kw) <= 8]
+    
     # 優先順位でソート：
     # 1. GLOBAL_WORDS_DATABASEに含まれるキーワード（長い順）
     # 2. KEYWORDS辞書からの抽出
     # 3. その他のキーワード（長い順）
-    keywords_from_global = [kw for kw in unique_keywords if kw in GLOBAL_WORDS_DATABASE]
+    keywords_from_global = [kw for kw in filtered_keywords if kw in GLOBAL_WORDS_DATABASE]
     keywords_from_global.sort(key=lambda x: (GLOBAL_WORDS_DATABASE.index(x) if x in GLOBAL_WORDS_DATABASE else 999, -len(x)))
     
-    keywords_from_dict = [kw for kw in unique_keywords if kw not in keywords_from_global and any(kw in kws or any(k in kw for k in kws) for kws in KEYWORDS.values() for k in kws)]
+    keywords_from_dict = [kw for kw in filtered_keywords if kw not in keywords_from_global and any(kw in kws or any(k in kw for k in kws) for kws in KEYWORDS.values() for k in kws)]
     
-    other_keywords = [kw for kw in unique_keywords if kw not in keywords_from_global and kw not in keywords_from_dict]
+    other_keywords = [kw for kw in filtered_keywords if kw not in keywords_from_global and kw not in keywords_from_dict]
     other_keywords.sort(key=lambda x: -len(x))  # 長い順
     
     sorted_keywords = keywords_from_global + keywords_from_dict + other_keywords
