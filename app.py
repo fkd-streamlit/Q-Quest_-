@@ -18,6 +18,8 @@ from collections import Counter
 import pandas as pd
 import io
 import os
+import requests
+import json
 
 # Optuna for QUBO optimization visualization
 try:
@@ -592,6 +594,10 @@ SENSE_TO_VOW_MATRIX: Optional[np.ndarray] = None  # sense_to_vow行列（8x12：
 K_MATRIX: Optional[np.ndarray] = None  # k行列（12x12：キャラクター × 誓願）
 L_MATRIX: Optional[np.ndarray] = None  # l行列（12x4：キャラクター × 世界観軸）
 LOADED_GODS: Optional[List[Dict]] = None  # Excelから読み込んだ12神の情報
+CHAR_MASTER: Optional[pd.DataFrame] = None  # CHAR_MASTERシートのデータ
+SELECTED_ATTRIBUTE: Optional[str] = None  # ユーザーが選択した属性
+SELECTED_CHARACTER: Optional[str] = None  # ユーザーが選択したキャラクター（公式キャラ名）
+MAXIMS_DATABASE: Optional[List[Dict]] = None  # 格言ファイルから読み込んだ格言データベース
 
 def rebuild_globals_from_gods(gods_list: List[Dict]) -> None:
     """TWELVE_GODS 変更後に、VARIABLES / MAXIM_SOURCES を再生成"""
@@ -761,11 +767,29 @@ def load_gods_from_separate_files(
         st.error(f"詳細: {traceback.format_exc()}")
         raise
 
+def get_excel_sheet_names(excel_file: io.BytesIO) -> List[str]:
+    """Excelファイルのシート名一覧を取得"""
+    try:
+        excel_file.seek(0)
+        xl_file = pd.ExcelFile(excel_file, engine="openpyxl")
+        return xl_file.sheet_names
+    except Exception:
+        return []
+
+def find_sheet_by_keywords(excel_file: io.BytesIO, keywords: List[str]) -> Optional[str]:
+    """キーワードに基づいてシート名を検索"""
+    sheet_names = get_excel_sheet_names(excel_file)
+    for sheet_name in sheet_names:
+        for keyword in keywords:
+            if keyword in sheet_name:
+                return sheet_name
+    return None
+
 def load_gods_from_excel(excel_file: io.BytesIO) -> Tuple[List[Dict], np.ndarray, np.ndarray]:
     """1つのExcelファイルから12神の情報、k行列、l行列を読み込む（後方互換性のため）
     
     Args:
-        excel_file: Excelファイル（BytesIO）- 3つのシートを含む
+        excel_file: Excelファイル（BytesIO）- 複数のシートを含む
     
     Returns:
         (gods_list, k_matrix, l_matrix)
@@ -774,34 +798,171 @@ def load_gods_from_excel(excel_file: io.BytesIO) -> Tuple[List[Dict], np.ndarray
         # ファイルポインタをリセット（複数シートを読み込むため）
         excel_file.seek(0)
         
-        # 12神基本情報を読み込む
-        df_gods = pd.read_excel(excel_file, sheet_name="12神基本情報", engine="openpyxl")
+        # シート名を自動検出
+        sheet_names = get_excel_sheet_names(excel_file)
         
-        # ファイルポインタをリセット
-        excel_file.seek(0)
+        # 12神基本情報のシートを検索
+        gods_sheet = find_sheet_by_keywords(excel_file, ["CHAR_MASTER", "12神", "基本情報", "character", "CHAR"])
+        if gods_sheet is None:
+            # デフォルトのシート名を試す
+            try:
+                excel_file.seek(0)
+                df_gods = pd.read_excel(excel_file, sheet_name=0, engine="openpyxl")  # 最初のシート
+            except:
+                raise ValueError(f"キャラクター情報のシートが見つかりません。利用可能なシート: {sheet_names}")
+        else:
+            excel_file.seek(0)
+            df_gods = pd.read_excel(excel_file, sheet_name=gods_sheet, engine="openpyxl")
         
-        # k行列を読み込む
-        df_k = pd.read_excel(excel_file, sheet_name="k行列", engine="openpyxl", header=0, index_col=0)
-        df_k = df_k.iloc[:12, :12]
-        k_matrix = df_k.values.astype(float)
+        # CHAR_MASTERシートの場合、すべての情報が含まれている
+        is_char_master = gods_sheet and "CHAR_MASTER" in gods_sheet.upper()
         
-        # ファイルポインタをリセット
-        excel_file.seek(0)
+        # k行列の読み込み
+        if is_char_master:
+            # CHAR_MASTERシートにVOW_01～VOW_12が含まれている
+            vow_columns = [f"VOW_{i:02d}" for i in range(1, 13)]
+            if all(col in df_gods.columns for col in vow_columns):
+                # CHAR_MASTERからk行列を構築
+                df_k = df_gods.set_index("公式キャラ名")[vow_columns]
+                k_matrix = df_k.values.astype(float)
+            else:
+                # VOW列が見つからない場合、CHAR_TO_VOWシートを探す
+                excel_file.seek(0)
+                k_sheet = find_sheet_by_keywords(excel_file, ["CHAR_TO_VOW", "k行列", "K"])
+                if k_sheet:
+                    excel_file.seek(0)
+                    df_k = pd.read_excel(excel_file, sheet_name=k_sheet, engine="openpyxl", header=0)
+                    df_k = df_k.set_index("公式キャラ名")
+                    vow_columns = [col for col in df_k.columns if str(col).startswith("VOW_")]
+                    df_k = df_k[vow_columns[:12]]
+                    k_matrix = df_k.values.astype(float)
+                else:
+                    raise ValueError(f"k行列が見つかりません。CHAR_MASTERにVOW列がないか、CHAR_TO_VOWシートが見つかりません。")
+        else:
+            # CHAR_TO_VOWシートから読み込む
+            excel_file.seek(0)
+            k_sheet = find_sheet_by_keywords(excel_file, ["CHAR_TO_VOW", "k行列", "K"])
+            if k_sheet is None:
+                raise ValueError(f"k行列のシートが見つかりません。利用可能なシート: {sheet_names}")
+            
+            excel_file.seek(0)
+            df_k = pd.read_excel(excel_file, sheet_name=k_sheet, engine="openpyxl", header=0)
+            
+            # 行インデックスを設定（公式キャラ名またはCHAR_ID）
+            index_col = None
+            if "公式キャラ名" in df_k.columns:
+                index_col = "公式キャラ名"
+            elif "CHAR_ID" in df_k.columns:
+                index_col = "CHAR_ID"
+            
+            if index_col:
+                df_k = df_k.set_index(index_col)
+            
+            # VOW_01～VOW_12の列のみを選択（数値列のみ）
+            vow_columns = [col for col in df_k.columns if str(col).startswith("VOW_")]
+            if len(vow_columns) >= 12:
+                df_k = df_k[vow_columns[:12]]
+            else:
+                raise ValueError(f"VOW列が12個見つかりません。見つかった列: {vow_columns}")
+            
+            df_k = df_k.iloc[:12, :12]
+            k_matrix = df_k.values.astype(float)
         
-        # l行列を読み込む
-        df_l = pd.read_excel(excel_file, sheet_name="l行列", engine="openpyxl", header=0, index_col=0)
-        df_l = df_l.iloc[:12, :4]
-        l_matrix = df_l.values.astype(float)
+        # l行列の読み込み
+        if is_char_master:
+            # CHAR_MASTERシートにAXIS_SEI, AXIS_RYU, AXIS_MA, AXIS_MAKOTOが含まれている
+            axis_columns = ["AXIS_SEI", "AXIS_RYU", "AXIS_MA", "AXIS_MAKOTO"]
+            if all(col in df_gods.columns for col in axis_columns):
+                # CHAR_MASTERからl行列を構築
+                df_l = df_gods.set_index("公式キャラ名")[axis_columns]
+                l_matrix = df_l.values.astype(float)
+            else:
+                # AXIS列が見つからない場合、CHAR_TO_AXISシートを探す
+                excel_file.seek(0)
+                l_sheet = find_sheet_by_keywords(excel_file, ["CHAR_TO_AXIS", "l行列", "L"])
+                if l_sheet:
+                    excel_file.seek(0)
+                    df_l = pd.read_excel(excel_file, sheet_name=l_sheet, engine="openpyxl", header=0)
+                    df_l = df_l.set_index("公式キャラ名")
+                    axis_columns = ["AXIS_SEI", "AXIS_RYU", "AXIS_MA", "AXIS_MAKOTO"]
+                    df_l = df_l[axis_columns]
+                    l_matrix = df_l.values.astype(float)
+                else:
+                    raise ValueError(f"l行列が見つかりません。CHAR_MASTERにAXIS列がないか、CHAR_TO_AXISシートが見つかりません。")
+        else:
+            # CHAR_TO_AXISシートから読み込む
+            excel_file.seek(0)
+            l_sheet = find_sheet_by_keywords(excel_file, ["CHAR_TO_AXIS", "l行列", "L"])
+            if l_sheet is None:
+                raise ValueError(f"l行列のシートが見つかりません。利用可能なシート: {sheet_names}")
+            
+            excel_file.seek(0)
+            df_l = pd.read_excel(excel_file, sheet_name=l_sheet, engine="openpyxl", header=0)
+            
+            # 行インデックスを設定（公式キャラ名）
+            if "公式キャラ名" in df_l.columns:
+                df_l = df_l.set_index("公式キャラ名")
+            
+            # AXIS_SEI, AXIS_RYU, AXIS_MA, AXIS_MAKOTOの列のみを選択
+            axis_columns = ["AXIS_SEI", "AXIS_RYU", "AXIS_MA", "AXIS_MAKOTO"]
+            if all(col in df_l.columns for col in axis_columns):
+                df_l = df_l[axis_columns]
+            else:
+                raise ValueError(f"AXIS列が見つかりません。必要な列: {axis_columns}")
+            
+            df_l = df_l.iloc[:12, :4]
+            l_matrix = df_l.values.astype(float)
         
         # 12神の情報を構築
         gods_list = []
         for idx, row in df_gods.iterrows():
-            god_id = int(row.get("ID", idx))
-            god_name = str(row.get("名前", ""))
+            # CHAR_IDからIDを取得（CHAR_01 → 0, CHAR_02 → 1, ...）
+            char_id = str(row.get("CHAR_ID", "")).strip()
+            if char_id and char_id.startswith("CHAR_"):
+                try:
+                    god_id = int(char_id.replace("CHAR_", "")) - 1  # CHAR_01 → 0
+                except:
+                    god_id = int(row.get("ID", idx))
+            else:
+                god_id = int(row.get("ID", idx))
+            
+            # 名前の取得（CHAR_MASTERの場合、公式キャラ名を使用）
+            if "公式キャラ名" in row.index:
+                god_name = str(row.get("公式キャラ名", "")).strip()
+            else:
+                god_name = str(row.get("名前", ""))
+            
             god_name_en = str(row.get("名前(英語)", ""))
             god_attribute = str(row.get("属性", ""))
-            god_emoji = str(row.get("絵文字", ""))
-            god_description = str(row.get("説明", ""))
+            god_emoji = str(row.get("絵文字", "🔮"))
+            
+            # 説明の取得（役割補足説明または説明）
+            if "役割補足説明" in row.index:
+                god_description = str(row.get("役割補足説明", ""))
+            else:
+                god_description = str(row.get("説明", ""))
+            
+            # 公式キャラ名を取得（先に取得）
+            official_name = str(row.get("公式キャラ名", "")).strip()
+            
+            # IMAGE_FILEを取得（CHAR_TO_VOWシートから取得する場合もある）
+            image_file = str(row.get("IMAGE_FILE", "")).strip()
+            # CHAR_TO_VOWシートからIMAGE_FILEを取得（CHAR_MASTERにない場合）
+            if not image_file and is_char_master:
+                excel_file.seek(0)
+                k_sheet = find_sheet_by_keywords(excel_file, ["CHAR_TO_VOW"])
+                if k_sheet:
+                    try:
+                        excel_file.seek(0)
+                        df_char_to_vow = pd.read_excel(excel_file, sheet_name=k_sheet, engine="openpyxl", header=0)
+                        # 公式キャラ名でマッチング
+                        if official_name and "公式キャラ名" in df_char_to_vow.columns:
+                            matched_row = df_char_to_vow[df_char_to_vow["公式キャラ名"] == official_name]
+                            if not matched_row.empty and "IMAGE_FILE" in matched_row.columns:
+                                image_file = str(matched_row.iloc[0]["IMAGE_FILE"]).strip()
+                    except:
+                        pass
+            
             maxim_cells: List[str] = []
             maxim_cells.extend(_split_multi_text(row.get("格言", "")))
             for col in row.index:
@@ -812,15 +973,32 @@ def load_gods_from_excel(excel_file: io.BytesIO) -> Tuple[List[Dict], np.ndarray
             
             # k行列から誓願値を取得（vow01～vow12）
             vows = {}
-            for j in range(12):
-                vow_key = f"vow{j+1:02d}"
-                vows[vow_key] = float(k_matrix[god_id, j])
+            # CHAR_MASTERシートにVOW_01～VOW_12が含まれている場合は直接取得
+            if is_char_master and all(f"VOW_{i:02d}" in row.index for i in range(1, 13)):
+                for j in range(1, 13):
+                    vow_key = f"vow{j:02d}"
+                    vows[vow_key] = float(row.get(f"VOW_{j:02d}", 0.0))
+            else:
+                # k_matrixから取得
+                if god_id < len(k_matrix):
+                    for j in range(12):
+                        vow_key = f"vow{j+1:02d}"
+                        vows[vow_key] = float(k_matrix[god_id, j])
             
             # l行列から役割属性を取得
             role_names = ["stillness", "flow", "ma", "sincerity"]
             roles = {}
-            for j, role_name in enumerate(role_names):
-                roles[role_name] = float(l_matrix[god_id, j])
+            # CHAR_MASTERシートにAXIS列が含まれている場合は直接取得
+            if is_char_master and all(col in row.index for col in ["AXIS_SEI", "AXIS_RYU", "AXIS_MA", "AXIS_MAKOTO"]):
+                roles["stillness"] = float(row.get("AXIS_SEI", 0.0))
+                roles["flow"] = float(row.get("AXIS_RYU", 0.0))
+                roles["ma"] = float(row.get("AXIS_MA", 0.0))
+                roles["sincerity"] = float(row.get("AXIS_MAKOTO", 0.0))
+            else:
+                # l_matrixから取得
+                if god_id < len(l_matrix):
+                    for j, role_name in enumerate(role_names):
+                        roles[role_name] = float(l_matrix[god_id, j])
             
             god_dict = {
                 "id": god_id,
@@ -833,6 +1011,9 @@ def load_gods_from_excel(excel_file: io.BytesIO) -> Tuple[List[Dict], np.ndarray
                 "maxim": god_maxim,
                 "maxims": maxims_parsed,
                 "description": god_description,
+                "char_id": char_id if char_id else None,  # CHAR_IDを追加
+                "image_file": image_file if image_file else None,  # IMAGE_FILEを追加
+                "official_name": official_name if official_name else None,  # 公式キャラ名を追加
             }
             gods_list.append(god_dict)
         
@@ -862,6 +1043,47 @@ def load_sense_to_vow_matrix(sense_to_vow_file: io.BytesIO) -> np.ndarray:
         st.error(f"sense_to_vow行列の読み込みエラー: {str(e)}")
         raise
 
+def load_maxims_from_excel(maxim_file: io.BytesIO) -> List[Dict]:
+    """格言ファイル（Excel）を読み込む
+    
+    Args:
+        maxim_file: 格言ファイル（Excel）
+    
+    Returns:
+        格言のリスト（各要素は {"text": "格言", "source": "出典", "tags": ["タグ1", "タグ2"]}）
+    """
+    global MAXIMS_DATABASE
+    try:
+        maxim_file.seek(0)
+        df = pd.read_excel(maxim_file, engine="openpyxl", header=0)
+        
+        maxims_list = []
+        for idx, row in df.iterrows():
+            maxim_text = str(row.get("格言", "")).strip()
+            source = str(row.get("出典", "")).strip()
+            
+            if not maxim_text or maxim_text.lower() in ("nan", "none", ""):
+                continue
+            
+            # タグの処理（タグ列がある場合）
+            tags = []
+            if "タグ" in df.columns:
+                tag_str = str(row.get("タグ", "")).strip()
+                if tag_str and tag_str.lower() not in ("nan", "none"):
+                    tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+            
+            maxims_list.append({
+                "text": maxim_text,
+                "source": source if source else "伝統的な教え",
+                "tags": tags
+            })
+        
+        MAXIMS_DATABASE = maxims_list
+        return maxims_list
+    except Exception as e:
+        st.error(f"格言ファイルの読み込みエラー: {str(e)}")
+        return []
+
 def load_all_excel_files(
     character_file: io.BytesIO = None,
     maxim_file: io.BytesIO = None,
@@ -881,12 +1103,20 @@ def load_all_excel_files(
     Returns:
         True: 成功, False: 失敗
     """
-    return load_excel_config(
+    result = load_excel_config(
         character_file=character_file,
         k_matrix_file=k_matrix_file,
         l_matrix_file=l_matrix_file,
         sense_to_vow_file=sense_to_vow_file
     )
+    
+    # 格言ファイルを読み込む（オプション）
+    if maxim_file is not None and result:
+        maxims = load_maxims_from_excel(maxim_file)
+        if maxims:
+            st.success(f"✅ 格言ファイルを読み込みました（{len(maxims)}件）")
+    
+    return result
 
 def load_excel_config(
     excel_file: io.BytesIO = None,
@@ -981,7 +1211,10 @@ def build_qubo_hierarchical(x: np.ndarray, lambda_v: float = 5.0, lambda_c: floa
                             sense_to_vow_matrix: Optional[np.ndarray] = None,
                             k_matrix: Optional[np.ndarray] = None,
                             l_matrix: Optional[np.ndarray] = None,
-                            x_continuous: Optional[np.ndarray] = None) -> Dict[Tuple[int,int], float]:
+                            x_continuous: Optional[np.ndarray] = None,
+                            selected_attribute: Optional[str] = None,
+                            selected_character: Optional[str] = None,
+                            char_master: Optional[pd.DataFrame] = None) -> Dict[Tuple[int,int], float]:
     """多層バイナリ構造QUBOを生成（添付資料の設計に基づく）
     
     Args:
@@ -1168,6 +1401,33 @@ def build_qubo_hierarchical(x: np.ndarray, lambda_v: float = 5.0, lambda_c: floa
     if x[1] > 0 and x[7] > 0:
         Q[(1, 7)] = lambda_conf
     
+    # === 選択されたキャラクター/属性の調整 ===
+    # ユーザーが選択したキャラクターまたは属性を持つキャラクターのエネルギーを下げる
+    if selected_character or selected_attribute:
+        gods_list = LOADED_GODS if LOADED_GODS else TWELVE_GODS
+        for k, god in enumerate(gods_list):
+            c_idx = c_start + k
+            should_boost = False
+            
+            # キャラクターの直接選択
+            if selected_character:
+                god_name = god.get("name", "")
+                official_name = god.get("official_name", "")
+                if selected_character == god_name or selected_character == official_name:
+                    should_boost = True
+            
+            # 属性の選択
+            if selected_attribute and not should_boost:
+                god_attribute = god.get("attribute", "")
+                if selected_attribute == god_attribute:
+                    should_boost = True
+            
+            # 選択されたキャラクター/属性のエネルギーを下げる（選ばれやすくする）
+            if should_boost:
+                # キャラクター変数のエネルギーを下げる（負の値で引き寄せる）
+                current_energy = Q.get((c_idx, c_idx), 0)
+                Q[(c_idx, c_idx)] = current_energy - 3.0  # 大幅にエネルギーを下げる
+    
     return Q
 
 def build_qubo_base() -> Dict[Tuple[int,int], float]:
@@ -1221,7 +1481,10 @@ def select_god_from_mood(m: Mood) -> Dict:
 def build_qubo_from_mood(m: Mood, 
                          sense_to_vow_matrix: Optional[np.ndarray] = None,
                          k_matrix: Optional[np.ndarray] = None,
-                         l_matrix: Optional[np.ndarray] = None) -> Dict[Tuple[int,int], float]:
+                         l_matrix: Optional[np.ndarray] = None,
+                         selected_attribute: Optional[str] = None,
+                         selected_character: Optional[str] = None,
+                         char_master: Optional[pd.DataFrame] = None) -> Dict[Tuple[int,int], float]:
     """Moodに基づいて多層バイナリ構造QUBOを生成
     
     設計の流れ:
@@ -1255,13 +1518,25 @@ def build_qubo_from_mood(m: Mood,
     if l_matrix is None:
         l_matrix = L_MATRIX
     
+    # グローバル変数から選択されたキャラクター/属性を取得
+    global SELECTED_ATTRIBUTE, SELECTED_CHARACTER, CHAR_MASTER
+    if selected_attribute is None:
+        selected_attribute = SELECTED_ATTRIBUTE
+    if selected_character is None:
+        selected_character = SELECTED_CHARACTER
+    if char_master is None:
+        char_master = CHAR_MASTER
+    
     # 多層バイナリ構造QUBOを生成
     # x_continuousを渡して、感覚の強さを重みとして使用
     Q = build_qubo_hierarchical(x, 
                                  sense_to_vow_matrix=sense_to_vow_matrix,
                                  k_matrix=k_matrix, 
                                  l_matrix=l_matrix,
-                                 x_continuous=x_continuous)
+                                 x_continuous=x_continuous,
+                                 selected_attribute=selected_attribute,
+                                 selected_character=selected_character,
+                                 char_master=char_master)
     
     return Q
 
@@ -1297,8 +1572,18 @@ def solve_all_with_optuna(Q: Dict[Tuple[int,int], float], use_hierarchical: bool
         v_start = None
         c_start = None
     
-    # Optuna Studyを作成（in-memory database）
-    study = optuna.create_study(direction='minimize', study_name='qubo_optimization')
+    # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
+    import time
+    random_seed = int(time.time() * 1000) % 1000000
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+    
+    # Optuna Studyを作成（in-memory database、ランダムシードを設定）
+    study = optuna.create_study(
+        direction='minimize', 
+        study_name='qubo_optimization',
+        sampler=optuna.samplers.TPESampler(seed=random_seed) if OPTUNA_AVAILABLE else None
+    )
     
     def objective(trial):
         # バイナリ変数を生成
@@ -1371,19 +1656,42 @@ def solve_all_with_optuna(Q: Dict[Tuple[int,int], float], use_hierarchical: bool
     
     sols.sort(key=lambda t: t[0])
     
+    # 同エネルギーの解をランダムにシャッフルして多様性を確保
+    grouped_sols = []
+    current_energy = None
+    current_group = []
+    for e, x in sols:
+        if current_energy is None or abs(e - current_energy) < 0.001:
+            current_group.append((e, x))
+            current_energy = e
+        else:
+            random.shuffle(current_group)
+            grouped_sols.extend(current_group)
+            current_group = [(e, x)]
+            current_energy = e
+    if current_group:
+        random.shuffle(current_group)
+        grouped_sols.extend(current_group)
+    
     if progress_container is not None:
         with progress_container:
             st.success(f"✅ 最適化完了！最適エネルギー: {study.best_value:.3f}")
     
-    return sols, study
+    return grouped_sols, study
 
 def solve_all(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False) -> List[Tuple[float, np.ndarray]]:
-    """QUBOの全解を探索
+    """QUBOの全解を探索（毎回異なる結果を得るため、ランダム要素を追加）
     
     Args:
         Q: QUBO辞書
         use_hierarchical: 多層バイナリ構造を使用する場合True
     """
+    # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
+    import time
+    random_seed = int(time.time() * 1000) % 1000000
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+    
     if use_hierarchical:
         # 多層バイナリ構造の場合
         # 変数の総数: 8（感覚）+ 12（誓願）+ 12（キャラクター）= 32
@@ -1401,6 +1709,8 @@ def solve_all(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False) ->
     # ここでは簡易的に全探索を実装（実際の運用では最適化が必要）
     max_samples = 2**min(n, 16)  # 2^16 = 65536まで
     if n <= 16:
+        # 全探索の場合でも、結果をランダムにシャッフルして多様性を確保
+        all_sols = []
         for bits in itertools.product([0,1], repeat=n):
             x = np.array(bits, dtype=int)
             # one-hot制約をチェック（階層構造の場合）
@@ -1412,10 +1722,30 @@ def solve_all(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False) ->
                 # one-hot制約を満たす解のみを追加（厳密に1つだけ選ばれている）
                 if vow_sum == 1 and char_sum == 1:
                     e = qubo_energy(x, Q)
-                    sols.append((e, x))
+                    all_sols.append((e, x))
             else:
                 e = qubo_energy(x, Q)
-                sols.append((e, x))
+                all_sols.append((e, x))
+        
+        # エネルギーでソート後、同エネルギーの解をランダムにシャッフル
+        all_sols.sort(key=lambda t: t[0])
+        # 同エネルギーのグループごとにランダムにシャッフル
+        grouped_sols = []
+        current_energy = None
+        current_group = []
+        for e, x in all_sols:
+            if current_energy is None or abs(e - current_energy) < 0.001:
+                current_group.append((e, x))
+                current_energy = e
+            else:
+                random.shuffle(current_group)
+                grouped_sols.extend(current_group)
+                current_group = [(e, x)]
+                current_energy = e
+        if current_group:
+            random.shuffle(current_group)
+            grouped_sols.extend(current_group)
+        sols = grouped_sols
     else:
         # 大きい場合はランダムサンプリング（one-hot制約を満たす解のみ）
         valid_samples = 0
@@ -1454,8 +1784,26 @@ def solve_all(Q: Dict[Tuple[int,int], float], use_hierarchical: bool = False) ->
                     e = qubo_energy(x, Q)
                     sols.append((e, x))
     
+    # エネルギーでソート後、同エネルギーの解をランダムにシャッフル
     sols.sort(key=lambda t: t[0])
-    return sols
+    # 同エネルギーのグループごとにランダムにシャッフル
+    grouped_sols = []
+    current_energy = None
+    current_group = []
+    for e, x in sols:
+        if current_energy is None or abs(e - current_energy) < 0.001:
+            current_group.append((e, x))
+            current_energy = e
+        else:
+            random.shuffle(current_group)
+            grouped_sols.extend(current_group)
+            current_group = [(e, x)]
+            current_energy = e
+    if current_group:
+        random.shuffle(current_group)
+        grouped_sols.extend(current_group)
+    
+    return grouped_sols
 
 # -------------------------
 # ボルツマンサンプリング
@@ -1522,8 +1870,16 @@ def boltzmann_sample(cands: List[Tuple[float, np.ndarray]], T: float) -> Tuple[f
     
     return cands[idx]
 
-def temperature_from_mood(m: Mood) -> float:
-    """Moodに基づいてボルツマンサンプリングの温度を調整（改善版）"""
+def temperature_from_mood(m: Mood, selected_character: Optional[str] = None) -> float:
+    """Moodに基づいてボルツマンサンプリングの温度を調整（改善版）
+    
+    Args:
+        m: Moodオブジェクト
+        selected_character: 選択されたキャラクター（オプション）
+    
+    Returns:
+        温度パラメータ
+    """
     # ベース温度（好奇心が高いと揺らぎが大きくなる）
     T = 0.4 + 0.3 * m.curiosity
     
@@ -1538,6 +1894,10 @@ def temperature_from_mood(m: Mood) -> float:
     
     # 孤独感が高いと、より確定的に（温度を下げる）
     T *= (1.0 - 0.2 * m.loneliness)
+    
+    # キャラクターが選択されている場合、最低温度を確保して多様性を維持
+    if selected_character:
+        T = max(0.35, T)  # 最低温度0.35を確保
     
     # 温度の範囲を制限（揺らぎすぎない、収束しすぎない）
     return max(0.2, min(0.9, T))
@@ -1747,15 +2107,38 @@ def oracle_card(
     x: np.ndarray,
     mood: Mood = None,
     use_hierarchical: bool = False,
-    context_text: str = ""
+    context_text: str = "",
+    use_llm: bool = False,
+    llm_type: str = "huggingface"
 ) -> Dict:
-    """格言ベースのおみくじカードを生成（Moodに応じて変化、12神対応）"""
+    """格言ベースのおみくじカードを生成（Moodに応じて変化、12神対応）
+    
+    Args:
+        e: エネルギー値
+        x: 解ベクトル
+        mood: Moodオブジェクト
+        use_hierarchical: 階層構造を使用するか
+        context_text: ユーザーの入力テキスト
+        use_llm: LLMを使用するか
+        llm_type: LLMの種類（"ollama" or "huggingface"）
+    """
     # 選ばれた神を取得（先に取得して、格言も取得）
     selected_god = get_selected_god_from_x(x, mood, use_hierarchical=use_hierarchical)
     
     # 格言を取得（階層構造の場合はユーザー文面で複数選ぶ）
     if use_hierarchical:
         picks = select_maxims_for_god(selected_god, context_text=context_text, top_k=2, include_famous_quote=True)
+        
+        # 格言データベースからも追加で選択
+        if MAXIMS_DATABASE and context_text:
+            keywords = extract_keywords_safe(context_text, top_n=5)
+            db_maxims = select_maxims_from_database(keywords, top_k=2)
+            for db_maxim in db_maxims:
+                maxim_text = db_maxim.get("text", "")
+                if maxim_text and maxim_text not in picks:
+                    picks.append(maxim_text)
+                    if len(picks) >= 4:
+                        break
     else:
         picks = picks_from_x(x, use_hierarchical=use_hierarchical, selected_god=selected_god)
     
@@ -1769,6 +2152,21 @@ def oracle_card(
             picks = ["今この瞬間を大切に。すべては縁で繋がっている。"]
     
     season = random.choice(SEASONS)
+    
+    # LLMを使用してパーソナライズされた神託を生成（オプション）
+    llm_oracle = None
+    if use_llm and context_text and mood:
+        try:
+            llm_oracle = generate_oracle_with_llm(
+                user_text=context_text,
+                selected_god=selected_god,
+                selected_maxims=picks,
+                mood=mood,
+                llm_type=llm_type
+            )
+        except Exception as e:
+            # LLM生成に失敗した場合、通常の格言を使用
+            pass
     
     # Moodに応じて「次の一歩」を選択
     if mood is not None:
@@ -1803,8 +2201,197 @@ def oracle_card(
         "picks": picks,
         "poem": poem,
         "hint": hint,
-        "god": selected_god  # 選ばれた神の情報を追加
+        "god": selected_god,  # 選ばれた神の情報を追加
+        "llm_oracle": llm_oracle  # LLM生成の神託（オプション）
     }
+
+# -------------------------
+# LLM統合（無償で使用可能）
+# -------------------------
+def generate_oracle_with_llm(
+    user_text: str,
+    selected_god: Dict,
+    selected_maxims: List[str],
+    mood: Mood,
+    llm_type: str = "huggingface"  # "ollama" or "huggingface"
+) -> str:
+    """LLMを使用してパーソナライズされた神託を生成
+    
+    Args:
+        user_text: ユーザーの入力テキスト
+        selected_god: 選ばれたキャラクター
+        selected_maxims: 選ばれた格言リスト
+        mood: ユーザーの感情状態
+        llm_type: LLMの種類（"ollama" or "huggingface"）
+    
+    Returns:
+        生成された神託テキスト
+    """
+    # プロンプトを構築
+    god_name = selected_god.get("name", "神")
+    god_description = selected_god.get("description", "")
+    maxims_text = "\n".join([f"- {m}" for m in selected_maxims[:3]])
+    
+    prompt = f"""あなたは{god_name}です。{god_description}
+
+ユーザーの悩みや気持ち：
+「{user_text}」
+
+ユーザーの感情状態：
+- 疲れ: {mood.fatigue:.2f}
+- 不安/焦り: {mood.anxiety:.2f}
+- 好奇心: {mood.curiosity:.2f}
+- 孤独: {mood.loneliness:.2f}
+- 決断力: {mood.decisiveness:.2f}
+
+関連する格言：
+{maxims_text}
+
+上記の情報を基に、ユーザーに寄り添う温かみのある神託（50-100文字程度）を生成してください。
+日本の伝統的な「おみくじ」のスタイルで、希望と励ましを含む内容にしてください。
+"""
+    
+    if llm_type == "ollama":
+        return generate_with_ollama(prompt)
+    elif llm_type == "huggingface":
+        return generate_with_huggingface(prompt)
+    else:
+        # LLMが使用できない場合、格言ベースの神託を返す
+        return f"{maxims_text}\n\nあなたの観測が、この世界線を確定させました。"
+
+def generate_with_ollama(prompt: str, model: str = "llama3.2") -> str:
+    """Ollamaを使用してLLMでテキストを生成（ローカル実行）
+    
+    Args:
+        prompt: プロンプト
+        model: 使用するモデル名（デフォルト: llama3.2）
+    
+    Returns:
+        生成されたテキスト
+    """
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "max_tokens": 200
+                }
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("response", "").strip()
+        else:
+            return ""
+    except Exception as e:
+        # Ollamaが起動していない場合など
+        return ""
+
+def generate_with_huggingface(prompt: str, model: str = "microsoft/DialoGPT-medium") -> str:
+    """Hugging Face Inference APIを使用してテキストを生成（無料枠）
+    
+    Args:
+        prompt: プロンプト
+        model: 使用するモデル名（デフォルト: Mistral-7B-Instruct）
+    
+    Returns:
+        生成されたテキスト
+    """
+    try:
+        # Hugging Face Inference API（無料枠）
+        # 注意: 実際の使用時は、Hugging FaceのAPIキーが必要な場合があります
+        # 無料枠では、公開モデルを使用できます
+        
+        # Hugging Face Inference APIを使用（無料枠）
+        # APIキーが設定されている場合は使用、なければ公開エンドポイントを使用
+        api_key = os.getenv("HUGGINGFACE_API_KEY", "")
+        
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        
+        # 無料で使用可能なモデル（テキスト生成用）
+        # 注意: モデルによってはAPIキーが必要な場合があります
+        api_url = f"https://api-inference.huggingface.co/models/{model}"
+        
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 150,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "return_full_text": False
+            }
+        }
+        
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            # レスポンス形式に応じてテキストを抽出
+            if isinstance(result, list) and len(result) > 0:
+                if "generated_text" in result[0]:
+                    return result[0]["generated_text"].strip()
+                elif "text" in result[0]:
+                    return result[0]["text"].strip()
+            elif isinstance(result, dict):
+                if "generated_text" in result:
+                    return result["generated_text"].strip()
+                elif "text" in result:
+                    return result["text"].strip()
+        
+        # APIエラーの場合、空文字を返す（フォールバック）
+        return ""
+    except Exception as e:
+        # エラーが発生した場合、空文字を返す（フォールバック）
+        return ""
+
+def select_maxims_from_database(keywords: List[str], top_k: int = 3) -> List[Dict]:
+    """格言データベースからキーワードに基づいて格言を選択
+    
+    Args:
+        keywords: キーワードリスト
+        top_k: 選択する格言の数
+    
+    Returns:
+        選択された格言のリスト
+    """
+    global MAXIMS_DATABASE
+    if not MAXIMS_DATABASE:
+        return []
+    
+    # キーワードに基づいてスコアリング
+    scored_maxims = []
+    keyword_set = set([kw.lower() for kw in keywords])
+    
+    for maxim in MAXIMS_DATABASE:
+        score = 0.0
+        maxim_text = maxim.get("text", "").lower()
+        maxim_tags = [tag.lower() for tag in maxim.get("tags", [])]
+        
+        # タグ一致を優先
+        for tag in maxim_tags:
+            if tag in keyword_set:
+                score += 3.0
+        
+        # テキスト内のキーワード一致
+        for kw in keyword_set:
+            if kw in maxim_text:
+                score += 1.0
+        
+        if score > 0:
+            scored_maxims.append((score, maxim))
+    
+    # スコアでソート
+    scored_maxims.sort(key=lambda x: x[0], reverse=True)
+    
+    # 上位k個を選択
+    return [maxim for _, maxim in scored_maxims[:top_k]]
 
 # -------------------------
 # キーワード抽出とネットワーク構築（Cell 4用）
@@ -1839,21 +2426,30 @@ def calculate_energy_between_words(word1: str, word2: str) -> float:
         if word1 in words and word2 in words:
             energy -= 0.5
     
-    energy += np.random.normal(0, 0.1)
+    # 毎回異なる結果を得るため、タイムスタンプベースのランダム要素を追加
+    energy += np.random.normal(0, 0.15)
     return energy
 
 def build_word_network(center_words: List[str], database: List[str], n_neighbors: int = 15) -> Dict:
+    """単語ネットワークを構築（毎回異なる結果を得るため、ランダムシードを追加）"""
+    # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
+    import time
+    random_seed = int(time.time() * 1000) % 1000000
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+    
     all_words = list(set(center_words + database))
     word_energies = {}
     for word in all_words:
         if word in center_words:
             energy = -2.0
         else:
+            # ランダム要素を追加して毎回異なる結果を得る
             energies = [calculate_energy_between_words(cw, word) for cw in center_words]
-            energy = np.mean(energies)
+            energy = np.mean(energies) + np.random.normal(0, 0.1)  # ランダム要素を追加
         word_energies[word] = energy
     
-    sorted_words = sorted(word_energies.items(), key=lambda x: x[1])
+    sorted_words = sorted(word_energies.items(), key=lambda x: (x[1], np.random.random()))  # 同点の場合はランダム
     selected_words = center_words.copy()
     for word, energy in sorted_words:
         if word not in center_words and len(selected_words) < n_neighbors:
@@ -1868,7 +2464,8 @@ def build_word_network(center_words: List[str], database: List[str], n_neighbors
     for i, word1 in enumerate(selected_words):
         for j, word2 in enumerate(selected_words[i+1:], start=i+1):
             energy = calculate_energy_between_words(word1, word2)
-            if energy < -0.3:
+            # 閾値を少し緩和して、より多くのエッジを表示
+            if energy < -0.25:
                 network['edges'].append((i, j, energy))
     
     return network
@@ -1895,30 +2492,92 @@ def place_words_on_sphere(n_words: int, center_indices: List[int]) -> np.ndarray
     return positions
 
 def select_relevant_quote(keywords: List[str]) -> str:
+    """キーワードに基づいて関連する格言を選択（毎回異なる結果を得るため、ランダム要素を追加）"""
+    # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
+    import time
+    random.seed(int(time.time() * 1000) % 1000000)
+    
     keyword_set = set(keywords)
-    best_match = None
-    best_score = 0
+    scored_quotes = []
     
     for quote_data in FAMOUS_QUOTES:
         quote_keywords = set(quote_data["keywords"])
         score = len(keyword_set & quote_keywords)
-        if score > best_score:
-            best_score = score
-            best_match = quote_data["quote"]
+        # スコアに小さなランダム要素を追加して、毎回異なる結果を得る
+        score += random.uniform(-0.3, 0.3)
+        scored_quotes.append((score, quote_data["quote"]))
     
-    if best_match is None:
-        best_match = "あなたの観測が、この世界線を確定させました。"
+    # スコアでソート
+    scored_quotes.sort(key=lambda x: x[0], reverse=True)
     
-    return best_match
+    # 上位3つからランダムに選択（多様性を確保）
+    if scored_quotes:
+        top_quotes = [q for _, q in scored_quotes[:3]]
+        return random.choice(top_quotes)
+    
+    return "あなたの観測が、この世界線を確定させました。"
 
 # -------------------------
 # キャラクター表示
 # -------------------------
-def render_god_character(god: Dict) -> str:
+def get_character_image_path(god: Dict, gods_list: Optional[List[Dict]] = None) -> Optional[str]:
+    """キャラクター画像のパスを取得"""
+    # IMAGE_FILEから取得（実際のファイル名を使用）
+    image_file = god.get("image_file")
+    if image_file:
+        # ファイル名をそのまま使用（CHAR_p1.pngなど）
+        if image_file.endswith(".png"):
+            image_path = f"assets/images/characters/{image_file}"
+            if os.path.exists(image_path):
+                return image_path
+        # CHAR_p1.png形式の場合
+        if image_file.startswith("CHAR_p"):
+            image_path = f"assets/images/characters/{image_file}"
+            if os.path.exists(image_path):
+                return image_path
+    
+    # CHAR_IDから取得
+    char_id = god.get("char_id")
+    if char_id and char_id.startswith("CHAR_"):
+        try:
+            char_num = int(char_id.replace("CHAR_", ""))
+            # CHAR_01 → CHAR_p1.png
+            image_path = f"assets/images/characters/CHAR_p{char_num}.png"
+            if os.path.exists(image_path):
+                return image_path
+        except:
+            pass
+    
+    # IDから取得（CHAR_p1.png形式を試す）
+    god_id = god.get("id", 0)
+    image_path = f"assets/images/characters/CHAR_p{god_id+1}.png"
+    if os.path.exists(image_path):
+        return image_path
+    
+    # character_01.png形式も試す（後方互換性）
+    image_path = f"assets/images/characters/character_{god_id+1:02d}.png"
+    if os.path.exists(image_path):
+        return image_path
+    
+    return None
+
+def render_god_character(god: Dict, gods_list: Optional[List[Dict]] = None) -> str:
     """選ばれた神のキャラクターをHTMLで表示"""
     god_name = god["name"]
     god_emoji = god["emoji"]
     god_description = god["description"]
+    
+    # 画像パスを取得
+    image_path = get_character_image_path(god, gods_list)
+    image_html = ""
+    if image_path and os.path.exists(image_path):
+        try:
+            import base64
+            with open(image_path, "rb") as img_file:
+                img_data = base64.b64encode(img_file.read()).decode()
+                image_html = f'<img src="data:image/png;base64,{img_data}" style="max-width: 300px; max-height: 300px; border-radius: 10px; margin-bottom: 20px;" />'
+        except Exception:
+            pass
     
     # f-stringを使わず、通常の文字列でHTMLを生成（CSSの{}をエスケープする必要がない）
     character_html = """
@@ -2006,7 +2665,7 @@ def render_god_character(god: Dict) -> str:
         </style>
         
         <div style="position: relative; text-align: center; z-index: 1;">
-            <div class="god-emoji">""" + god_emoji + """</div>
+            """ + (image_html if image_html else f'<div class="god-emoji">{god_emoji}</div>') + """
             <div class="god-name">""" + god_name + """</div>
             <div class="god-description">""" + god_description + """</div>
         </div>
@@ -2060,15 +2719,22 @@ def create_3d_network_plot(network: Dict, positions: np.ndarray, center_indices:
         fig.add_trace(go.Scatter3d(
             x=[x], y=[y], z=[z],
             mode='markers+text',
-            marker=dict(size=size, color=color, line=dict(width=1, color='white')),
+            marker=dict(
+                size=size, 
+                color=color, 
+                line=dict(width=2, color='white'),
+                opacity=0.6 if not is_center else 0.9
+            ),
             text=[word],
             textposition="middle center",
             textfont=dict(
-                size=14 if is_center else 10, 
-                color=color
+                size=20 if is_center else 16, 
+                color='#ffd700' if is_center else '#ffffff',  # 中心語は金色、その他は白色
+                family='Arial, sans-serif',
+                weight='bold'  # すべて太字で見やすく
             ),
             name=word,
-            hovertemplate=f'<b>{word}</b><extra></extra>'
+            hovertemplate=f'<b>{word}</b><br>エネルギー: {network["energies"].get(word, 0):.2f}<extra></extra>'
         ))
     
     fig.update_layout(
@@ -2191,9 +2857,23 @@ def main():
             help="12神の設定、k行列、l行列を含むExcelファイル（3つのシート）"
         )
         
+        # 格言ファイルのアップロード（オプション）
+        maxim_file = st.sidebar.file_uploader(
+            "格言ファイル (格言.xlsx) - オプション",
+            type=['xlsx', 'xls'],
+            key="maxim_file_single",
+            help="格言データベース（格言、出典、タグを含むExcelファイル）"
+        )
+        
         if uploaded_file is not None:
             if load_excel_config(excel_file=uploaded_file):
                 st.sidebar.success("✅ 設定ファイルを読み込みました")
+                
+                # 格言ファイルを読み込む（オプション）
+                if maxim_file is not None:
+                    maxims = load_maxims_from_excel(maxim_file)
+                    if maxims:
+                        st.sidebar.success(f"✅ 格言ファイルを読み込みました（{len(maxims)}件）")
                 if LOADED_GODS:
                     st.sidebar.info(f"読み込まれた神の数: {len(LOADED_GODS)}")
                     # 読み込んだ設定の詳細を表示（展開可能）
@@ -2244,6 +2924,14 @@ def main():
             help="キャラクター × 世界観軸（12x4の行列：静、流、間、誠）"
         )
         
+        # 格言ファイルのアップロード（オプション）
+        maxim_file = st.sidebar.file_uploader(
+            "5. 格言ファイル (格言.xlsx) - オプション",
+            type=['xlsx', 'xls'],
+            key="maxim_file_separate",
+            help="格言データベース（格言、出典、タグを含むExcelファイル）"
+        )
+        
         if k_matrix_file is not None and l_matrix_file is not None:
             if load_excel_config(
                 character_file=character_file,
@@ -2252,6 +2940,12 @@ def main():
                 l_matrix_file=l_matrix_file
             ):
                 st.sidebar.success("✅ 設定ファイルを読み込みました")
+                
+                # 格言ファイルを読み込む（オプション）
+                if maxim_file is not None:
+                    maxims = load_maxims_from_excel(maxim_file)
+                    if maxims:
+                        st.sidebar.success(f"✅ 格言ファイルを読み込みました（{len(maxims)}件）")
                 if LOADED_GODS:
                     st.sidebar.info(f"読み込まれた神の数: {len(LOADED_GODS)}")
                     # 読み込んだ設定の詳細を表示（展開可能）
@@ -2273,6 +2967,48 @@ def main():
         else:
             st.sidebar.info("💡 デフォルト設定を使用中")
     
+    # キャラクターと属性の選択（量子重ねの効果を出すため）
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎭 キャラクター選択（オプション）")
+    
+    global SELECTED_ATTRIBUTE, SELECTED_CHARACTER, CHAR_MASTER
+    
+    # 属性の選択
+    if LOADED_GODS:
+        # 属性の一覧を取得
+        attributes = set()
+        for god in LOADED_GODS:
+            attr = god.get("attribute", "")
+            if attr:
+                attributes.add(attr)
+        
+        if attributes:
+            selected_attribute = st.sidebar.selectbox(
+                "属性を選択（オプション）",
+                ["選択しない"] + sorted(list(attributes)),
+                help="属性を選択すると、その属性を持つキャラクターが選ばれやすくなります（量子重ねの効果）"
+            )
+            SELECTED_ATTRIBUTE = selected_attribute if selected_attribute != "選択しない" else None
+            
+            # 選択された属性のキャラクターを表示
+            if SELECTED_ATTRIBUTE:
+                matching_gods = [god for god in LOADED_GODS if god.get("attribute") == SELECTED_ATTRIBUTE]
+                if matching_gods:
+                    st.sidebar.info(f"**{SELECTED_ATTRIBUTE}**属性のキャラクター: {len(matching_gods)}体")
+                    with st.sidebar.expander(f"📋 {SELECTED_ATTRIBUTE}属性のキャラクター一覧"):
+                        for god in matching_gods:
+                            st.write(f"- {god.get('emoji', '🔮')} {god.get('name', '')}")
+        
+        # キャラクターの直接選択
+        character_names = [god.get("name", "") for god in LOADED_GODS if god.get("name")]
+        if character_names:
+            selected_character = st.sidebar.selectbox(
+                "キャラクターを直接選択（オプション）",
+                ["選択しない"] + character_names,
+                help="キャラクターを直接選択すると、そのキャラクターが選ばれやすくなります（量子重ねの効果）"
+            )
+            SELECTED_CHARACTER = selected_character if selected_character != "選択しない" else None
+    
     st.sidebar.markdown("---")
     app_mode = st.sidebar.selectbox(
         "実行モードを選択",
@@ -2283,40 +3019,73 @@ def main():
         st.header("QUBO × 縁：基本デモ")
         st.markdown("基本的なQUBOモデルを使用した「縁」のデモンストレーション")
         
+        # 基本デモでもキャラクター選択を反映
+        st.info("💡 サイドバーでキャラクターや属性を選択すると、QUBOに反映されます")
+        
         if st.button("実行"):
-            Q = Q_BASE
-            sols = solve_all(Q)
+            # キャラクター選択を反映したQUBOを生成
+            # デフォルトのMoodを使用（全て0.5）
+            default_mood = Mood(
+                fatigue=0.5,
+                anxiety=0.5,
+                curiosity=0.5,
+                loneliness=0.5,
+                decisiveness=0.5
+            )
+            
+            # 選択されたキャラクター/属性を反映したQUBOを生成
+            Q = build_qubo_from_mood(
+                default_mood,
+                selected_attribute=SELECTED_ATTRIBUTE,
+                selected_character=SELECTED_CHARACTER,
+                char_master=CHAR_MASTER
+            )
+            
+            # 階層構造を使用
+            sols = solve_all(Q, use_hierarchical=True)
             
             # 結果表示
             st.subheader("低エネルギー上位（選ばれた格言の重なり）")
             for rank, (e, x) in enumerate(sols[:8], start=1):
-                picks = [VARIABLES[i] for i,v in enumerate(x) if v==1]
-                if picks:
-                    picks_str = " | ".join(picks[:2])  # 長いので最大2つまで
-                    if len(picks) > 2:
-                        picks_str += f" ...（他{len(picks)-2}つ）"
+                # 階層構造の場合、キャラクターと格言を取得
+                if len(x) >= 32:
+                    selected_god = get_selected_god_from_x(x, default_mood, use_hierarchical=True)
+                    picks = select_maxims_for_god(selected_god, context_text="", top_k=2, include_famous_quote=False)
+                    if picks:
+                        picks_str = " | ".join(picks[:2])
+                    else:
+                        picks_str = selected_god.get("maxim", "今この瞬間を大切に")
                 else:
-                    picks_str = "今この瞬間を大切に"
-                st.write(f"{rank}. E={e:>6.3f}  x={bitstring(x)}")
+                    picks = [VARIABLES[i] for i,v in enumerate(x) if v==1]
+                    if picks:
+                        picks_str = " | ".join(picks[:2])  # 長いので最大2つまで
+                        if len(picks) > 2:
+                            picks_str += f" ...（他{len(picks)-2}つ）"
+                    else:
+                        picks_str = "今この瞬間を大切に"
+                
+                st.write(f"{rank}. E={e:>6.3f}")
                 st.caption(f"   格言: {picks_str}")
             
-            # エネルギー地形の可視化
-            labels = [bitstring(x) for _, x in sols]
-            energies = [e for e, _ in sols]
+            # エネルギー地形の可視化（簡略版）
+            if len(sols) > 0:
+                energies = [e for e, _ in sols[:20]]  # 上位20個のみ表示
+                labels = [f"解{i+1}" for i in range(len(energies))]
+                
+                fig_bar = px.bar(
+                    x=labels,
+                    y=energies,
+                    labels={'x': '解', 'y': 'エネルギー'},
+                    title="Energy landscape（低いほど「縁が結ばれやすい候補」）"
+                )
+                fig_bar.update_xaxes(tickangle=-90)
+                st.plotly_chart(fig_bar, use_container_width=True)
             
-            fig_bar = px.bar(
-                x=labels,
-                y=energies,
-                labels={'x': '状態', 'y': 'エネルギー'},
-                title="Energy landscape（低いほど「縁が結ばれやすい候補」）"
-            )
-            fig_bar.update_xaxes(tickangle=-90)
-            st.plotly_chart(fig_bar, use_container_width=True)
-            
-            # おみくじ（基本デモではmoodなし）
+            # おみくじ（基本デモでも階層構造を使用）
             oracle_pool = sols[:6]
-            e_pick, x_pick = boltzmann_sample(oracle_pool, T=0.45)
-            card = oracle_card(e_pick, x_pick, mood=None, use_hierarchical=False, context_text="")
+            T = temperature_from_mood(default_mood, SELECTED_CHARACTER)
+            e_pick, x_pick = boltzmann_sample(oracle_pool, T=T)
+            card = oracle_card(e_pick, x_pick, mood=default_mood, use_hierarchical=True, context_text="")
             
             st.markdown("---")
             st.subheader("量子おみくじ（Quantum Oracle）")
@@ -2324,27 +3093,60 @@ def main():
             # 選ばれた神のキャラクターを表示
             if 'god' in card and card['god']:
                 selected_god = card['god']
-                character_html = render_god_character(selected_god)
+                character_html = render_god_character(selected_god, LOADED_GODS)
                 st.components.v1.html(character_html, height=400)
             
             st.write(f"**エネルギー**: {card['energy']:.3f}")
             
             # 選ばれた格言と引用元を表示
             picks_display = []
-            for pick in card['picks']:
-                source_info = get_maxim_source(pick)
-                picks_display.append(f"{pick} *（{source_info['source']}）*")
+            if card.get('picks') and len(card['picks']) > 0:
+                for pick in card['picks']:
+                    source_info = get_maxim_source(pick)
+                    picks_display.append(f"{pick} *（{source_info['source']}）*")
+            else:
+                # 格言が空の場合、選ばれた神の格言を使用
+                selected_god_from_card = card.get('god')
+                if selected_god_from_card:
+                    if selected_god_from_card.get("maxim"):
+                        maxim = selected_god_from_card["maxim"]
+                        source_info = get_maxim_source(maxim)
+                        picks_display.append(f"{maxim} *（{source_info['source']}）*")
+                    elif selected_god_from_card.get("description"):
+                        desc = selected_god_from_card["description"]
+                        picks_display.append(f"{desc} *（{selected_god_from_card.get('name', '神託')}）*")
+            
+            if not picks_display:
+                picks_display.append("今この瞬間を大切に。すべては縁で繋がっている。 *（伝統的な教え）*")
             
             st.write(f"**選ばれた縁**:")
             for pick_text in picks_display:
                 st.markdown(f"   - {pick_text}")
             
-            st.write(f"**ことば**: 「{card['poem']}」")
-            st.write(f"**次の一歩**: {card['hint']}")
+            st.write(f"**ことば**: 「{card.get('poem', '今この瞬間を大切に。')}」")
+            st.write(f"**次の一歩**: {card.get('hint', '一歩ずつ進んでいきましょう。')}")
     
     elif app_mode == "対話型量子神託":
         st.header("対話型量子神託")
         st.markdown("あなたの悩み・気持ちを入力すると、パーソナライズされた「縁」を提示します")
+        
+        # LLM使用オプション
+        col1, col2 = st.columns(2)
+        with col1:
+            use_llm = st.checkbox(
+                "🤖 LLMでパーソナライズされた神託を生成",
+                value=False,
+                help="LLMを使用して、よりパーソナライズされた神託を生成します（無償で使用可能）"
+            )
+        with col2:
+            if use_llm:
+                llm_type = st.selectbox(
+                    "LLMの種類",
+                    ["huggingface", "ollama"],
+                    help="Hugging Face: 無料API（推奨） / Ollama: ローカル実行（要インストール）"
+                )
+            else:
+                llm_type = "huggingface"
         
         user_text = st.text_area(
             "今日の悩み・気持ちを一文でどうぞ",
@@ -2407,7 +3209,7 @@ def main():
                 
                 # おみくじ（Moodに応じて変化）
                 pool = sols[:6]
-                T = temperature_from_mood(m)
+                T = temperature_from_mood(m, SELECTED_CHARACTER)
                 e_pick, x_pick = boltzmann_sample(pool, T=T)
                 
                 # デバッグ: 解ベクトルの内容を確認
@@ -2419,7 +3221,7 @@ def main():
                         # キャラクターが選ばれていない場合、Moodから選択
                         st.warning("⚠️ キャラクター変数が選ばれていません。Moodから選択します。")
                 
-                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=user_text)  # Moodを渡す
+                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=user_text, use_llm=use_llm, llm_type=llm_type)  # Moodを渡す
                 
                 st.markdown("---")
                 st.subheader("量子おみくじ（Quantum Oracle）")
@@ -2427,7 +3229,7 @@ def main():
                 # 選ばれた神のキャラクターを表示
                 if 'god' in card and card['god']:
                     selected_god = card['god']
-                    character_html = render_god_character(selected_god)
+                    character_html = render_god_character(selected_god, LOADED_GODS)
                     st.components.v1.html(character_html, height=400)
                 
                 # 選ばれた格言の引用元情報を収集
@@ -2448,6 +3250,15 @@ def main():
                         sources_text.append(f"- {desc}\n  *出典: {selected_god_from_card.get('name', '神託')}*")
                     else:
                         sources_text.append("- 今この瞬間を大切に。すべては縁で繋がっている。\n  *出典: 伝統的な教え*")
+                
+                            # LLM生成の神託を「選ばれた縁」に統合
+                if card.get('llm_oracle') and use_llm and card['llm_oracle'].strip():
+                    # LLM生成の神託を最初に追加
+                    llm_text = card['llm_oracle'].strip()
+                    sources_text.insert(0, f"🤖 {llm_text}\n  *出典: LLM生成 - パーソナライズされた神託*")
+                elif use_llm:
+                    # LLM生成に失敗した場合、フォールバックメッセージを追加
+                    sources_text.insert(0, f"💭 LLM生成は現在利用できません。格言ベースの神託を表示しています。\n  *出典: 伝統的な教え*")
                 
                 st.info(f"""
 **エネルギー**: {card['energy']:.3f}
@@ -2610,7 +3421,7 @@ def main():
                 
                 # おみくじ（Moodに応じて変化）
                 pool = sols[:6]
-                T = temperature_from_mood(m)
+                T = temperature_from_mood(m, SELECTED_CHARACTER)
                 e_pick, x_pick = boltzmann_sample(pool, T=T)
                 
                 # デバッグ: 解ベクトルの内容を確認
@@ -2622,7 +3433,7 @@ def main():
                         # キャラクターが選ばれていない場合、Moodから選択
                         st.warning("⚠️ キャラクター変数が選ばれていません。Moodから選択します。")
                 
-                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=ema_text)
+                card = oracle_card(e_pick, x_pick, mood=m, use_hierarchical=True, context_text=ema_text, use_llm=False, llm_type="huggingface")
                 
                 # 選ばれた神を取得
                 selected_god = card['god'] if 'god' in card else select_god_from_mood(m)
@@ -2632,7 +3443,7 @@ def main():
                     time.sleep(1.0)
                 
                 # 選ばれた神のキャラクターを表示
-                character_html = render_god_character(selected_god)
+                character_html = render_god_character(selected_god, LOADED_GODS)
                 st.components.v1.html(character_html, height=400)
                 
                 st.markdown("---")
