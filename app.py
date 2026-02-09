@@ -2407,7 +2407,13 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
         found_keywords = [w for w in words if len(w) >= 2][:top_n]
     return found_keywords[:top_n]
 
-def calculate_energy_between_words(word1: str, word2: str) -> float:
+def calculate_energy_between_words(
+    word1: str, 
+    word2: str,
+    selected_character: Optional[str] = None,
+    selected_attribute: Optional[str] = None,
+    char_master: Optional[pd.DataFrame] = None
+) -> float:
     energy = 0.0
     common_chars = set(word1) & set(word2)
     if common_chars:
@@ -2426,12 +2432,64 @@ def calculate_energy_between_words(word1: str, word2: str) -> float:
         if word1 in words and word2 in words:
             energy -= 0.5
     
+    # キャラクター選択を反映
+    if selected_character and char_master is not None:
+        try:
+            # 選択されたキャラクターの行を取得
+            char_row = None
+            if "公式キャラ名" in char_master.columns:
+                char_row = char_master[char_master["公式キャラ名"] == selected_character]
+            elif "CHAR_ID" in char_master.columns:
+                char_row = char_master[char_master["CHAR_ID"] == selected_character]
+            
+            if char_row is not None and not char_row.empty:
+                # VOW値が高い単語を優先（単語とVOWの対応は簡易的に実装）
+                # 単語がキャラクターの特徴と関連する場合、エネルギーを下げる（近づける）
+                vow_values = []
+                for i in range(1, 13):
+                    vow_col = f"VOW_{i:02d}"
+                    if vow_col in char_row.columns:
+                        vow_val = char_row[vow_col].iloc[0]
+                        if pd.notna(vow_val):
+                            vow_values.append(float(vow_val))
+                
+                if vow_values:
+                    avg_vow = np.mean(vow_values)
+                    # キャラクターの特徴が強い場合、単語間のエネルギーを下げる（近づける）
+                    energy -= avg_vow * 0.2
+                
+                # 属性選択を反映
+                if selected_attribute and "属性" in char_row.columns:
+                    char_attribute = char_row["属性"].iloc[0]
+                    if pd.notna(char_attribute) and str(char_attribute) == selected_attribute:
+                        # 属性が一致する場合、さらにエネルギーを下げる
+                        energy -= 0.3
+        except Exception:
+            # エラーが発生した場合は無視（デフォルトの計算を続行）
+            pass
+    
     # 毎回異なる結果を得るため、タイムスタンプベースのランダム要素を追加
     energy += np.random.normal(0, 0.15)
     return energy
 
-def build_word_network(center_words: List[str], database: List[str], n_neighbors: int = 15) -> Dict:
-    """単語ネットワークを構築（毎回異なる結果を得るため、ランダムシードを追加）"""
+def build_word_network(
+    center_words: List[str], 
+    database: List[str], 
+    n_neighbors: int = 15,
+    selected_character: Optional[str] = None,
+    selected_attribute: Optional[str] = None,
+    char_master: Optional[pd.DataFrame] = None
+) -> Dict:
+    """単語ネットワークを構築（毎回異なる結果を得るため、ランダムシードを追加）
+    
+    Args:
+        center_words: 中心となる単語のリスト
+        database: 単語データベース
+        n_neighbors: 選択する近傍単語の数
+        selected_character: 選択されたキャラクター（公式キャラ名）
+        selected_attribute: 選択された属性
+        char_master: CHAR_MASTERシートのデータ
+    """
     # 毎回異なる結果を得るため、タイムスタンプベースのシードを使用
     import time
     random_seed = int(time.time() * 1000) % 1000000
@@ -2445,7 +2503,15 @@ def build_word_network(center_words: List[str], database: List[str], n_neighbors
             energy = -2.0
         else:
             # ランダム要素を追加して毎回異なる結果を得る
-            energies = [calculate_energy_between_words(cw, word) for cw in center_words]
+            energies = [
+                calculate_energy_between_words(
+                    cw, word, 
+                    selected_character=selected_character,
+                    selected_attribute=selected_attribute,
+                    char_master=char_master
+                ) 
+                for cw in center_words
+            ]
             energy = np.mean(energies) + np.random.normal(0, 0.1)  # ランダム要素を追加
         word_energies[word] = energy
     
@@ -2463,7 +2529,12 @@ def build_word_network(center_words: List[str], database: List[str], n_neighbors
     
     for i, word1 in enumerate(selected_words):
         for j, word2 in enumerate(selected_words[i+1:], start=i+1):
-            energy = calculate_energy_between_words(word1, word2)
+            energy = calculate_energy_between_words(
+                word1, word2,
+                selected_character=selected_character,
+                selected_attribute=selected_attribute,
+                char_master=char_master
+            )
             # 閾値を少し緩和して、より多くのエッジを表示
             if energy < -0.25:
                 network['edges'].append((i, j, energy))
@@ -3352,8 +3423,15 @@ def main():
                 keywords = extract_keywords(user_input)
                 st.write(f"**抽出されたキーワード**: {', '.join(keywords)}")
                 
-                # ネットワーク構築
-                network = build_word_network(keywords, GLOBAL_WORDS_DATABASE, n_neighbors=20)
+                # ネットワーク構築（キャラクター選択を反映）
+                network = build_word_network(
+                    keywords, 
+                    GLOBAL_WORDS_DATABASE, 
+                    n_neighbors=20,
+                    selected_character=SELECTED_CHARACTER,
+                    selected_attribute=SELECTED_ATTRIBUTE,
+                    char_master=CHAR_MASTER
+                )
                 
                 # 3D配置
                 center_indices = [i for i, word in enumerate(network['words']) if word in keywords]
